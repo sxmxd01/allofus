@@ -1,0 +1,8 @@
+{
+  "name": "CLAT Terminal Prep",
+  "description": "Unified terminal-style CLAT exam preparation platform featuring Syllabus Tracker, Passage-View Drill Mode, Sprint Speed-run with live leaderboard, and Live Dump shared notes.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
