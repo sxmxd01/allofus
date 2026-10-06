@@ -25,7 +25,7 @@ import {
   recordUserAttempt,
   fetchLiveLeaderboard,
 } from '../lib/clatService';
-import { supabase } from '../lib/supabase';
+import { supabaseOneliners } from '../lib/supabase';
 
 interface CrowdsourceSolverProps {
   activeUsername: string;
@@ -76,11 +76,11 @@ export const CrowdsourceSolver: React.FC<CrowdsourceSolverProps> = ({
 
   // Real-time leaderboard updates
   useEffect(() => {
-    const channel = supabase
+    const channel = supabaseOneliners
       .channel('realtime:user_attempts:crowdsource')
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'user_attempts' },
+        { event: '*', schema: 'public', table: 'questions' },
         async () => {
           const fresh = await fetchLiveLeaderboard(activeUsername);
           setLeaderboard(fresh);
@@ -89,7 +89,7 @@ export const CrowdsourceSolver: React.FC<CrowdsourceSolverProps> = ({
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      supabaseOneliners.removeChannel(channel);
     };
   }, [activeUsername]);
 

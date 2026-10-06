@@ -13,8 +13,11 @@
     "@supabase/supabase-js": "^2.117.2",
     "clsx": "^2.1.1",
     "lucide-react": "^1.49.0",
+    "mermaid": "^12.1.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
+    "react-markdown": "^10.1.0",
+    "react-mermaid2": "^0.1.4",
     "tailwind-merge": "^3.5.0"
   },
   "devDependencies": {

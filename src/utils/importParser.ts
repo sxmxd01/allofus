@@ -2,7 +2,35 @@ export type ImportDestination =
   | 'gk_qb_mocks'
   | 'gk_qb_current'
   | 'quants_caselet'
-  | 'ar_puzzle';
+  | 'ar_puzzle'
+  | 'mental_math';
+
+export const QT_TOPICS = [
+  'Ratios & Percentages',
+  'Profit Loss Discount',
+  'Interest',
+  'Time Speed Distance',
+  'Time and Work',
+  'Mensuration',
+  'Mixtures',
+  'Probability',
+  'Misc',
+] as const;
+
+export type QTTopic = typeof QT_TOPICS[number];
+
+export const AR_TOPICS = [
+  'Linear Arrangements',
+  'Circular Arrangements',
+  'Blood Relations',
+  'Coding-Decoding',
+  'Distance and Direction',
+  'Misc',
+] as const;
+
+export type ARTopic = typeof AR_TOPICS[number];
+
+export type QuestionDifficultyLevel = 'Very Easy' | 'Easy' | 'Moderate' | 'Hard';
 
 export interface ParsedQuestionItem {
   id: string;
@@ -13,7 +41,7 @@ export interface ParsedQuestionItem {
   explanation: string;
   category?: string;
   subtopic?: string;
-  difficulty?: 'Easy' | 'Moderate' | 'Hard';
+  difficulty?: QuestionDifficultyLevel;
   source?: string;
   isValid: boolean;
   errors: string[];
@@ -26,6 +54,7 @@ export interface ParsedPassageItem {
   wordCount: number;
   readTimeMinutes: number;
   source: string;
+  solution_video_url?: string;
   isValid: boolean;
   errors: string[];
 }
@@ -41,12 +70,14 @@ export interface ParseResult {
 }
 
 /**
- * Deterministic, pure-regex parser for CLAT question banks and caselets.
- * Zero AI or LLM dependencies.
+ * Deterministic, resilient regex parser for CLAT question banks and caselets.
+ * Upgraded to seamlessly handle AI-generated text files with multi-line statements,
+ * missing separators, option markers like (a), and metadata tags.
  */
 export function parseImportData(
   rawText: string,
-  destination: ImportDestination
+  destination: ImportDestination,
+  selectedTopic?: string
 ): ParseResult {
   const result: ParseResult = {
     destination,
@@ -63,9 +94,12 @@ export function parseImportData(
     return result;
   }
 
-  const isPassageBased = destination === 'quants_caselet' || destination === 'ar_puzzle';
+  // Look for an optional line at the bottom formatted as Video Link: [URL]
+  const videoLinkMatch = text.match(/(?:^|\n)\s*Video Link:\s*(https?:\/\/[^\s\n\r]+)/i);
+  const solutionVideoUrl = videoLinkMatch ? videoLinkMatch[1].trim() : undefined;
 
-  let questionsText = text;
+  const isPassageBased = destination === 'quants_caselet' || destination === 'ar_puzzle';
+  let questionsText = text.replace(/(?:^|\n)\s*Video Link:\s*https?:\/\/[^\s\n\r]+/gi, '').trim();
 
   // 1. If target is 'Quants' or 'AR': Extract passage strictly between delimiters
   if (isPassageBased) {
@@ -101,10 +135,14 @@ export function parseImportData(
         }
 
         if (!extractedTitle) {
-          extractedTitle =
-            destination === 'quants_caselet'
-              ? 'Quantitative Caselet'
-              : 'Analytical Deductive Puzzle';
+          if (selectedTopic) {
+            extractedTitle = `${selectedTopic} Passage`;
+          } else {
+            extractedTitle =
+              destination === 'quants_caselet'
+                ? 'Quantitative Caselet'
+                : 'Analytical Deductive Puzzle';
+          }
         }
 
         // Extract source if present
@@ -130,31 +168,48 @@ export function parseImportData(
           wordCount,
           readTimeMinutes,
           source: extractedSource,
+          solution_video_url: solutionVideoUrl,
           isValid: passageErrors.length === 0,
           errors: passageErrors,
         };
       }
 
       // Remaining text after PASSAGE END contains the questions
-      questionsText = text.substring(endIndex + endMatch[0].length).trim();
+      questionsText = text
+        .substring(endIndex + endMatch[0].length)
+        .replace(/(?:^|\n)\s*Video Link:\s*https?:\/\/[^\s\n\r]+/gi, '')
+        .trim();
     }
   }
 
-  // 2. Split questions by '---' (triple dashes)
-  const rawChunks = questionsText
-    .split(/\n\s*---\s*\n|\n\s*---+\s*$/m)
-    .map((chunk) => chunk.trim())
-    .filter((chunk) => chunk.length > 0);
-
-  const chunksToParse = rawChunks.length > 0 ? rawChunks : [questionsText];
-
-  chunksToParse.forEach((chunk, index) => {
-    // If chunk does not look like a question block, skip only if very short non-question metadata
-    if (!chunk.match(/[A-D]\s*[\).]/i) && chunk.length < 25) {
-      return;
+  // 2. Block Splitting (Tolerating missing separators):
+  // Standardize text by finding every instance of a question number at the start of a line (e.g., Q1., Q42.)
+  let rawBlocks: string[] = [];
+  if (/(?:^|\n)\s*Q\d+\./i.test(questionsText)) {
+    // Regex split strategy: const blocks = rawText.split(/(?:^|\n)(?=Q\d+\.)/i);
+    rawBlocks = questionsText.split(/(?:^|\n)(?=Q\d+\.)/i);
+  } else if (/\n\s*---\s*\n|\n\s*---+\s*$/m.test(questionsText)) {
+    rawBlocks = questionsText.split(/\n\s*---\s*\n|\n\s*---+\s*$/m);
+  } else {
+    // Fallback: split by line starting with number like 1. or Question 1:
+    rawBlocks = questionsText.split(/(?:^|\n)(?=(?:Q\d+[:.]?|Question\s*\d+[:.]?|\d+[\).]\s+[A-Z]))/i);
+    if (rawBlocks.length <= 1) {
+      rawBlocks = [questionsText];
     }
+  }
 
+  // Filter out any block that does not contain an option marker (e.g., (a)).
+  // This automatically strips out rogue document headers, introductory text, or batch titles.
+  const validBlocks = rawBlocks
+    .map((b) => b.trim())
+    .filter((b) => b.length > 0 && /(?:\([a-dA-D]\)|^[ \t]*[a-dA-D]\s*[\).])/im.test(b));
+
+  validBlocks.forEach((chunk, index) => {
     const item = parseSingleQuestion(chunk, index + 1);
+    if (selectedTopic) {
+      item.category = selectedTopic;
+      item.subtopic = selectedTopic;
+    }
     result.questions.push(item);
   });
 
@@ -173,8 +228,7 @@ export function parseImportData(
 }
 
 /**
- * Deterministically parses a single question block via strict regex.
- * STRICT VALIDATION: EVERY question must successfully parse 4 options and 1 valid Answer [A-D].
+ * Deterministically parses a single question block via resilient regex rules.
  */
 function parseSingleQuestion(
   chunk: string,
@@ -182,79 +236,113 @@ function parseSingleQuestion(
 ): ParsedQuestionItem {
   const errors: string[] = [];
 
-  // 1. Extract prompt: Everything before Option A
-  const optAIndex = chunk.search(/^[ \t]*[A]\s*[\).]/m);
+  // Extraneous Metadata: Ignore any lines containing Archetype: or Fact ID Used:
+  const cleanChunk = chunk
+    .split('\n')
+    .filter((line) => !/^\s*(?:Archetype:|Fact ID Used:)/i.test(line))
+    .join('\n');
 
+  // 1. Question Prompt: Extract everything from the start of the block (stripping the Q1. prefix) up to the first option (a).
+  // This ensures multi-line statements (1., 2., 3.) are kept as part of the question prompt.
+  const optAMatch = cleanChunk.match(/^\s*(?:\([aA]\)|[aA]\s*[\).])/m);
   let prompt = '';
-  if (optAIndex !== -1) {
-    prompt = chunk.substring(0, optAIndex).trim();
+  if (optAMatch && optAMatch.index !== undefined) {
+    prompt = cleanChunk.substring(0, optAMatch.index).trim();
   } else {
-    errors.push('Missing Option A marker (e.g. "A) ...")');
-    prompt = chunk.split('\n')[0] || 'Unknown Prompt';
+    errors.push('Missing Option (a) marker (e.g. "(a) ...")');
+    prompt = cleanChunk.split('\n')[0] || 'Unknown Prompt';
   }
 
-  // Strip leading question numbering like "Q1." or "1." or "Question 1:"
-  prompt = prompt.replace(/^(?:Q\d+[:.]?|Question\s*\d+[:.]?|\d+[\).])\s*/i, '').trim();
+  // Strip leading question numbering like "Q1." or "Q42." or "Question 1:" or "1."
+  prompt = prompt
+    .replace(/^(?:Q\d+[:.]?|Question\s*\d+[:.]?|\d+[\).])\s*/i, '')
+    .trim();
+
   if (!prompt) {
     errors.push('Prompt statement is empty');
   }
 
-  // 2. Extract Options: Match lines starting with A), B), C), D) (and A., B., C., D.)
-  const optionRegex = /^[ \t]*([A-D])\s*[\).]\s*(.+)$/gim;
-  const optionsMap: Record<string, string> = {};
+  // 2. Options A-D: Extract using a regex that tolerates leading spaces/indentation:
+  // /^\s*\([aA]\)\s+(.+)/m, /^\s*\([bB]\)\s+(.+)/m, etc.
+  const extractOption = (letter: 'a' | 'b' | 'c' | 'd'): string => {
+    // Primary regex: tolerating leading spaces/indentation with parentheses
+    const parenRegex = new RegExp(`^\\s*\\([${letter}${letter.toUpperCase()}]\\)\\s+(.+)`, 'm');
+    const parenMatch = cleanChunk.match(parenRegex);
+    if (parenMatch && parenMatch[1].trim()) {
+      return parenMatch[1].trim();
+    }
 
-  let match: RegExpExecArray | null;
-  while ((match = optionRegex.exec(chunk)) !== null) {
-    const letter = match[1].toUpperCase();
-    const content = match[2].trim();
-    if (!optionsMap[letter]) {
-      optionsMap[letter] = content;
+    // Resilient fallback: A) or A. or A:
+    const altRegex = new RegExp(`^\\s*[${letter}${letter.toUpperCase()}]\\s*[\\).:]\\s*(.+)`, 'm');
+    const altMatch = cleanChunk.match(altRegex);
+    if (altMatch && altMatch[1].trim()) {
+      return altMatch[1].trim();
+    }
+
+    return '';
+  };
+
+  const optionA = extractOption('a');
+  const optionB = extractOption('b');
+  const optionC = extractOption('c');
+  const optionD = extractOption('d');
+
+  if (!optionA) errors.push('Missing Option (a)');
+  if (!optionB) errors.push('Missing Option (b)');
+  if (!optionC) errors.push('Missing Option (c)');
+  if (!optionD) errors.push('Missing Option (d)');
+
+  const options: string[] = [optionA, optionB, optionC, optionD];
+
+  // 3. Answer Key: Extract using a regex that tolerates indentation and parentheses:
+  // /^\s*Answer:\s*\(([a-dA-D])\)/im
+  let correctAnswer: 'A' | 'B' | 'C' | 'D' | null = null;
+  const parenAnswerMatch = cleanChunk.match(/^\s*Answer:\s*\(([a-dA-D])\)/im);
+  if (parenAnswerMatch) {
+    correctAnswer = parenAnswerMatch[1].toUpperCase() as 'A' | 'B' | 'C' | 'D';
+  } else {
+    // Tolerant fallback for Answer: A or Answer: (A)
+    const plainAnswerMatch = cleanChunk.match(/^\s*Answer\s*[:=\-]\s*(?:\(([a-dA-D])\)|([a-dA-D]))/im);
+    if (plainAnswerMatch) {
+      const letter = plainAnswerMatch[1] || plainAnswerMatch[2];
+      correctAnswer = letter.toUpperCase() as 'A' | 'B' | 'C' | 'D';
+    } else {
+      errors.push('Missing Answer (e.g. "Answer: (a)")');
     }
   }
 
-  const options: string[] = [
-    optionsMap['A'] || '',
-    optionsMap['B'] || '',
-    optionsMap['C'] || '',
-    optionsMap['D'] || '',
-  ];
-
-  if (!optionsMap['A']) errors.push('Missing Option A');
-  if (!optionsMap['B']) errors.push('Missing Option B');
-  if (!optionsMap['C']) errors.push('Missing Option C');
-  if (!optionsMap['D']) errors.push('Missing Option D');
-
-  // 3. Extract Answer: Match `Answer: [A-D]`
-  let correctAnswer: 'A' | 'B' | 'C' | 'D' | null = null;
-  const answerMatch = chunk.match(/^[ \t]*Answer\s*[:=\-]\s*([A-D])/im);
-  if (answerMatch) {
-    correctAnswer = answerMatch[1].toUpperCase() as 'A' | 'B' | 'C' | 'D';
-  } else {
-    errors.push('Missing Answer (e.g. "Answer: A/B/C/D")');
-  }
-
-  // 4. Extract Explanation: Match `Explanation: [...]`
+  // 4. Explanation: Extract using /^\s*Explanation:\s*(.+)/im
   let explanation = '';
-  const explanationMatch = chunk.match(/^[ \t]*Explanation\s*[:=\-]\s*([\s\S]*?)(?=(?:^[ \t]*(?:Source|Category|Subtopic|Difficulty)|$))/im);
-  if (explanationMatch) {
-    explanation = explanationMatch[1].trim();
+  const multilineExpMatch = cleanChunk.match(
+    /^\s*Explanation:\s*([\s\S]*?)(?=(?:^\s*(?:Difficulty|Category|Subtopic|Source)\s*[:=]|$))/im
+  );
+  if (multilineExpMatch && multilineExpMatch[1].trim()) {
+    explanation = multilineExpMatch[1].trim();
+  } else {
+    const singleExpMatch = cleanChunk.match(/^\s*Explanation:\s*(.+)/im);
+    if (singleExpMatch) {
+      explanation = singleExpMatch[1].trim();
+    }
   }
 
-  // Optional metadata tags
+  // 5. Difficulty: Extract using /^\s*Difficulty:\s*(Very Easy|Easy|Moderate|Hard)/im. If not found, default to 'Moderate'
+  let difficulty: QuestionDifficultyLevel = 'Moderate';
+  const diffMatch = cleanChunk.match(/^\s*Difficulty:\s*(Very Easy|Easy|Moderate|Hard)/im);
+  if (diffMatch) {
+    difficulty = diffMatch[1] as QuestionDifficultyLevel;
+  }
+
+  // Optional Category, Subtopic, Source
   let category: string | undefined;
-  const catMatch = chunk.match(/^[ \t]*Category\s*[:=\-]\s*(.+)$/im);
+  const catMatch = cleanChunk.match(/^\s*Category\s*[:=\-]\s*(.+)$/im);
   if (catMatch) category = catMatch[1].trim();
 
   let subtopic: string | undefined;
-  const subMatch = chunk.match(/^[ \t]*Subtopic\s*[:=\-]\s*(.+)$/im);
+  const subMatch = cleanChunk.match(/^\s*Subtopic\s*[:=\-]\s*(.+)$/im);
   if (subMatch) subtopic = subMatch[1].trim();
 
-  let difficulty: 'Easy' | 'Moderate' | 'Hard' | undefined;
-  const diffMatch = chunk.match(/^[ \t]*Difficulty\s*[:=\-]\s*(Easy|Moderate|Hard)/im);
-  if (diffMatch) difficulty = diffMatch[1] as 'Easy' | 'Moderate' | 'Hard';
-
   let source: string | undefined;
-  const srcMatch = chunk.match(/^[ \t]*Source\s*[:=\-]\s*(.+)$/im);
+  const srcMatch = cleanChunk.match(/^\s*Source\s*[:=\-]\s*(.+)$/im);
   if (srcMatch) source = srcMatch[1].trim();
 
   return {
@@ -266,7 +354,7 @@ function parseSingleQuestion(
     explanation: explanation || 'Imported factual rationale.',
     category,
     subtopic,
-    difficulty: difficulty || 'Moderate',
+    difficulty,
     source: source || 'Import Batch',
     isValid: errors.length === 0,
     errors,
@@ -274,63 +362,67 @@ function parseSingleQuestion(
 }
 
 /**
- * Clean reference templates for the 4 destinations.
+ * Clean reference templates for the destinations.
  */
 export function getSampleTemplate(destination: ImportDestination): string {
   switch (destination) {
     case 'gk_qb_mocks':
-      return `Which Article of the Constitution of India guarantees the right against self-incrimination in criminal proceedings?
-A) Article 20(1)
-B) Article 20(2)
-C) Article 20(3)
-D) Article 21
-Answer: C
+      return `Q1. Which Article of the Constitution of India guarantees the right against self-incrimination in criminal proceedings?
+(a) Article 20(1)
+(b) Article 20(2)
+(c) Article 20(3)
+(d) Article 21
+Answer: (c)
 Explanation: Article 20(3) provides that no person accused of any offence shall be compelled to be a witness against himself.
 Category: Constitutional Law
 Subtopic: Fundamental Rights
 Difficulty: Moderate
-Source: CLAT Mock Series
+Archetype: Direct Article
+Fact ID Used: CONST-ART-20
 
----
-
-Under the Bharatiya Nyaya Sanhita (BNS), 2023, the offence of sedition has been replaced primarily under which section?
-A) Section 124A
-B) Section 152
-C) Section 197
-D) Section 112
-Answer: B
+Q2. Consider the following statements regarding the Bharatiya Nyaya Sanhita (BNS), 2023:
+1. It replaces the Indian Penal Code, 1860.
+2. The offence of sedition has been replaced primarily under Section 152.
+Which of the statements given above is/are correct?
+(a) 1 only
+(b) 2 only
+(c) Both 1 and 2
+(d) Neither 1 nor 2
+Answer: (c)
 Explanation: Section 152 of the BNS penalizes acts endangering the sovereignty, unity, and integrity of India.
 Category: Criminal Law
 Subtopic: BNS 2023
 Difficulty: Hard
-Source: Legal Digest`;
+Archetype: Multi-Statement
+Fact ID Used: BNS-SEC-152`;
 
     case 'gk_qb_current':
-      return `Who was sworn in as the 51st Chief Justice of India in November 2024?
-A) Justice Sanjiv Khanna
-B) Justice B.R. Gavai
-C) Justice Surya Kant
-D) Justice Hima Kohli
-Answer: A
+      return `Q1. Who was sworn in as the 51st Chief Justice of India in November 2024?
+(a) Justice Sanjiv Khanna
+(b) Justice B.R. Gavai
+(c) Justice Surya Kant
+(d) Justice Hima Kohli
+Answer: (a)
 Explanation: Justice Sanjiv Khanna succeeded Justice D.Y. Chandrachud as the 51st Chief Justice of India.
 Category: Judiciary & Appointments
 Subtopic: Supreme Court
 Difficulty: Easy
-Source: National Gazette
+Archetype: Appointment
+Fact ID Used: CJI-51
 
----
-
-India and the United Arab Emirates (UAE) formally operationalized which bilateral framework in 2024?
-A) Bilateral Investment Treaty
-B) Comprehensive Nuclear Accord
-C) Trans-Pacific Maritime Pact
-D) Dual Citizenship Protocol
-Answer: A
-Explanation: India and the UAE operationalized their Bilateral Investment Treaty with dedicated provisions for institutional commercial dispute settlement.
+Q2. Consider the following statements regarding the India-UAE Bilateral Investment Treaty:
+1. It was formally operationalized in 2024.
+2. It includes institutional commercial dispute settlement mechanisms.
+Which of the statements given above is/are correct?
+(a) 1 only
+(b) 2 only
+(c) Both 1 and 2
+(d) Neither 1 nor 2
+Answer: (c)
+Explanation: India and the UAE operationalized their Bilateral Investment Treaty with provisions for dispute resolution.
 Category: International Relations
 Subtopic: Bilateral Treaties
-Difficulty: Moderate
-Source: Ministry of External Affairs`;
+Difficulty: Moderate`;
 
     case 'quants_caselet':
       return `Title: Fast-Track Special Courts Budget Allocation
@@ -342,33 +434,34 @@ The Ministry of Law and Justice approved financial outlay for 1,023 Fast Track S
 In the northern region comprising 4 states, 240 FTSCs are operational. The ratio of POCSO courts to regular FTSCs in the northern region is 3:2. The average monthly operational cost per court is Rs. 6.25 Lakhs, with the Central Government contributing 60% and State Governments funding the remaining 40%.
 ### PASSAGE END
 
-What is the total number of regular (non-exclusive POCSO) FTSCs sanctioned across the country?
-A) 580
-B) 613
-C) 640
-D) 672
-Answer: B
+Q1. What is the total number of regular (non-exclusive POCSO) FTSCs sanctioned across the country?
+(a) 580
+(b) 613
+(c) 640
+(d) 672
+Answer: (b)
 Explanation: Total courts = 1,023. Exclusive POCSO = 410. Regular courts = 1,023 - 410 = 613 courts.
+Difficulty: Moderate
 
----
-
-In the northern region, how many exclusive POCSO courts are operational?
-A) 96
-B) 120
-C) 144
-D) 160
-Answer: C
+Q2. In the northern region, how many exclusive POCSO courts are operational?
+(a) 96
+(b) 120
+(c) 144
+(d) 160
+Answer: (c)
 Explanation: Northern total = 240. Ratio = 3:2. Total parts = 5. POCSO courts = (3/5) * 240 = 144 courts.
+Difficulty: Easy
 
----
+Q3. What is the Central Government's monthly financial contribution towards running all 240 courts in the northern region?
+(a) Rs. 7.50 Crores
+(b) Rs. 9.00 Crores
+(c) Rs. 10.25 Crores
+(d) Rs. 12.00 Crores
+Answer: (b)
+Explanation: Total cost per court = Rs. 6.25 Lakhs. Central share = 60% of 6.25 = Rs. 3.75 Lakhs. For 240 courts = 240 * 3.75 Lakhs = Rs. 9.00 Crores.
+Difficulty: Moderate
 
-What is the Central Government's monthly financial contribution towards running all 240 courts in the northern region?
-A) Rs. 7.50 Crores
-B) Rs. 9.00 Crores
-C) Rs. 10.25 Crores
-D) Rs. 12.00 Crores
-Answer: B
-Explanation: Total cost per court = Rs. 6.25 Lakhs. Central share = 60% of 6.25 = Rs. 3.75 Lakhs. For 240 courts = 240 * 3.75 Lakhs = Rs. 9.00 Crores.`;
+Video Link: https://www.youtube.com/watch?v=clat_quants_solution`;
 
     case 'ar_puzzle':
       return `Title: Supreme Court Constitution Bench Seating Protocol
@@ -384,32 +477,62 @@ Five Supreme Court judges—Justice A, Justice B, Justice C, Justice D, and Just
 5. Justice E is seated at Dais 1.
 ### PASSAGE END
 
-Which judge is seated at Dais 5 (extreme right)?
-A) Justice A
-B) Justice B
-C) Justice D
-D) Justice E
-Answer: C
+Q1. Which judge is seated at Dais 5 (extreme right)?
+(a) Justice A
+(b) Justice B
+(c) Justice D
+(d) Justice E
+Answer: (c)
 Explanation: Dais 1 = E, Dais 3 = C, Dais 4 = A. Justice D must be at an extreme end, so Dais 5 = D. Dais 2 = B. Thus Dais 5 is Justice D.
+Difficulty: Moderate
 
----
-
-Who is seated immediately to the left of the Chief Justice (Dais 2)?
-A) Justice A
-B) Justice B
-C) Justice D
-D) Justice E
-Answer: B
+Q2. Who is seated immediately to the left of the Chief Justice (Dais 2)?
+(a) Justice A
+(b) Justice B
+(c) Justice D
+(d) Justice E
+Answer: (b)
 Explanation: Since Dais 1 = E, Dais 3 = C, Dais 4 = A, and Dais 5 = D, Dais 2 is occupied by Justice B.
+Difficulty: Moderate
 
----
+Q3. Which two judges occupy the extreme dais positions (Dais 1 and Dais 5)?
+(a) Justice E and Justice D
+(b) Justice A and Justice E
+(c) Justice B and Justice D
+(d) Justice C and Justice E
+Answer: (a)
+Explanation: Justice E is at Dais 1 and Justice D is at Dais 5.
+Difficulty: Easy
 
-Which two judges occupy the extreme dais positions (Dais 1 and Dais 5)?
-A) Justice E and Justice D
-B) Justice A and Justice E
-C) Justice B and Justice D
-D) Justice C and Justice E
-Answer: A
-Explanation: Justice E is at Dais 1 and Justice D is at Dais 5.`;
+Video Link: https://www.youtube.com/watch?v=clat_ar_solution`;
+
+    case 'mental_math':
+      return `##LEVEL: 1 Rapid Addition & Subtraction Foundations
+===SET: 1===
+Q: 47 + 89
+A: 136
+FLOW: \`\`\`mermaid
+graph LR
+    A[47 + 89] --> B[47 + 90 = 137]
+    B --> C[137 - 1 = 136]
+\`\`\`
+**Optimal Path:** Round 89 to 90, then subtract 1 overshoot. 47 + 90 = 137; 137 - 1 = **136**.
+Q: 64 + 28
+A: 92
+FLOW: \`\`\`mermaid
+graph LR
+    A[64 + 28] --> B[64 + 30 = 94]
+    B --> C[94 - 2 = 92]
+\`\`\`
+**Optimal Path:** 64 + 30 = 94; 94 - 2 = **92**.
+Q: 83 - 39
+A: 44
+FLOW: \`\`\`mermaid
+graph LR
+    A[83 - 39] --> B[83 - 40 = 43]
+    B --> C[43 + 1 = 44]
+\`\`\`
+**Optimal Path:** 83 - 40 = 43; 43 + 1 = **44**.
+===END_SET===`;
   }
 }

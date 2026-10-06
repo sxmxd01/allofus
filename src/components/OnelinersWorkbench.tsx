@@ -20,10 +20,14 @@ import { sounds } from '../utils/sound';
 import {
   fetchUnsolvedQuestions,
   fetchSolvedSprintQuestions,
+  fetchNextOnelinerQuestion,
+  unlockQuestion,
   submitFactualAnswer,
   fetchLiveLeaderboard,
 } from '../lib/clatService';
-import { supabase } from '../lib/supabase';
+import { supabaseOneliners } from '../lib/supabase';
+import { executePrecisionSearch, copyQuestionForAI } from '../utils/searchHelper';
+import { JennyMascot, JennyLoadingState } from './JennyMascot';
 
 interface OnelinersWorkbenchProps {
   activeUsername: SquadMember;
@@ -49,30 +53,63 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
   const [selectedOption, setSelectedOption] = useState<number | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [extraNotesInput, setExtraNotesInput] = useState('');
-  const [copiedToast, setCopiedToast] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState('');
   const [editOptions, setEditOptions] = useState<string[]>(['', '', '', '']);
 
-  // Shared Leaderboard
+  // Shared Leaderboard & Live Ticker
   const [leaderboard, setLeaderboard] = useState<LeaderboardUser[]>([]);
+  const [recentTicker, setRecentTicker] = useState<{ user: string; questionId: string; time: string } | null>(null);
 
   // ========================================================
   // SPRINT MODE STATE: Questions where correct_answer IS NOT NULL
+  // (Zero database writes, strictly in-memory and localStorage)
   // ========================================================
+  const [sprintPlaylistScope, setSprintPlaylistScope] = useState<'all' | 'you'>('all');
   const [solvedPool, setSolvedPool] = useState<BankQuestion[]>([]);
   const [sprintIndex, setSprintIndex] = useState(0);
   const [sprintScore, setSprintScore] = useState(0);
-  const [sprintStreak, setSprintStreak] = useState(0);
+  const [sprintStreak, setSprintStreak] = useState<number>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem(`clat_sprint_streak_${activeUsername}`);
+      if (saved) return parseInt(saved, 10) || 0;
+    }
+    return 0;
+  });
   const [sprintTimeLeft, setSprintTimeLeft] = useState(10);
   const [sprintGameOver, setSprintGameOver] = useState(false);
   const [sprintWrongPicked, setSprintWrongPicked] = useState<number | null>(null);
-  const [cooldownSeconds, setCooldownSeconds] = useState(0);
+
+  // 60s cooldown penalty strictly managed via localStorage
+  const [cooldownSeconds, setCooldownSeconds] = useState<number>(() => {
+    if (typeof window !== 'undefined') {
+      const until = localStorage.getItem(`clat_sprint_cooldown_${activeUsername}`);
+      if (until) {
+        const diff = Math.ceil((parseInt(until, 10) - Date.now()) / 1000);
+        if (diff > 0) return Math.min(60, diff);
+      }
+    }
+    return 0;
+  });
+
   const sprintTimerRef = useRef<any>(null);
   const cooldownTimerRef = useRef<any>(null);
 
-  // 1. Load Unsolved questions for Solve Mode
+  // 1. Load Unsolved question for Solve Mode using get_next_question(user_name)
   const loadUnsolved = useCallback(async () => {
+    // 1. Priority: Existing RPC get_next_question(user_name)
+    const nextQ = await fetchNextOnelinerQuestion(activeUsername);
+    if (nextQ) {
+      setUnsolvedQueue([nextQ]);
+      setCurrentSolveIndex(0);
+      setSelectedOption(null);
+      setEditText(nextQ.text);
+      setEditOptions([...nextQ.options]);
+      setExtraNotesInput(nextQ.extraNotes || '');
+      return;
+    }
+
     const list = await fetchUnsolvedQuestions();
     setUnsolvedQueue(list);
     setCurrentSolveIndex(0);
@@ -82,14 +119,28 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
       setEditOptions([...list[0].options]);
       setExtraNotesInput(list[0].extraNotes || '');
     }
-  }, []);
+  }, [activeUsername]);
 
-  // 2. Load Solved questions for Sprint Mode
-  const loadSolved = useCallback(async () => {
-    const list = await fetchSolvedSprintQuestions();
-    setSolvedPool(list);
+  // 2. Load Solved questions for Sprint Mode (with Spaced Repetition ordering via localStorage)
+  const loadSolved = useCallback(async (scope: 'all' | 'you' = sprintPlaylistScope) => {
+    const list = await fetchSolvedSprintQuestions(scope, activeUsername);
+
+    // Spaced repetition ordering strictly via localStorage lastSeenAt
+    let lastSeenMap: Record<string, number> = {};
+    try {
+      const saved = localStorage.getItem('clat_sprint_last_seen');
+      if (saved) lastSeenMap = JSON.parse(saved);
+    } catch {}
+
+    const sorted = [...list].sort((a, b) => {
+      const aSeen = lastSeenMap[a.id] || 0;
+      const bSeen = lastSeenMap[b.id] || 0;
+      return aSeen - bSeen;
+    });
+
+    setSolvedPool(sorted);
     setSprintIndex(0);
-  }, []);
+  }, [sprintPlaylistScope, activeUsername]);
 
   useEffect(() => {
     loadUnsolved();
@@ -97,10 +148,42 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
     fetchLiveLeaderboard(activeUsername).then(setLeaderboard);
   }, [loadUnsolved, loadSolved, activeUsername]);
 
-  // Real-time listener for user_attempts and question updates
+  // Real-time listener: Subscribe to UPDATE events on questions where status = 'answered'
   useEffect(() => {
-    const channel = supabase
-      .channel('realtime:workbench:global')
+    const channel = supabaseOneliners
+      .channel('realtime:workbench:global:answered')
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'questions' },
+        async (payload) => {
+          const newRow = payload.new as any;
+          if (
+            newRow &&
+            (newRow.status === 'answered' ||
+              newRow.verification_status === 'answered' ||
+              newRow.correct_answer)
+          ) {
+            const freshLb = await fetchLiveLeaderboard(activeUsername);
+            setLeaderboard(freshLb);
+            const verifiedUser = newRow.answered_by || newRow.verified_by || newRow.user_name;
+            if (verifiedUser) {
+              setRecentTicker({
+                user: verifiedUser,
+                questionId: newRow.id,
+                time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              });
+            }
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'questions' },
+        async () => {
+          const freshLb = await fetchLiveLeaderboard(activeUsername);
+          setLeaderboard(freshLb);
+        }
+      )
       .on(
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'user_attempts' },
@@ -109,20 +192,12 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
           setLeaderboard(freshLb);
         }
       )
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'questions' },
-        () => {
-          loadUnsolved();
-          loadSolved();
-        }
-      )
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      supabaseOneliners.removeChannel(channel);
     };
-  }, [activeUsername, loadUnsolved, loadSolved]);
+  }, [activeUsername]);
 
   const activeSolveQ = unsolvedQueue[currentSolveIndex];
   const activeSprintQ = solvedPool[sprintIndex];
@@ -137,28 +212,30 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
     }
   }, [activeSolveQ]);
 
-  // Handle Search Google [S]
-  const handleSearchGoogle = useCallback(() => {
+  // 3. Precision Search Helper [S]
+  const handleSearchGoogle = useCallback(async () => {
     if (!activeSolveQ) return;
     sounds.playClick();
-    const cleaned = activeSolveQ.text
-      .replace(/^(Q\d+[:.]?|Question\s*\d+[:.]?)\s*/i, '')
-      .replace(/According to the passage,?/gi, '')
-      .replace(/Which of the following is true regarding/gi, '')
-      .replace(/Consider the following statements/gi, '')
-      .trim();
-    const query = encodeURIComponent(`${cleaned} legal GK news fact check`);
-    window.open(`https://www.google.com/search?q=${query}`, '_blank');
+    const result = await executePrecisionSearch(activeSolveQ.text, activeSolveQ.options);
+    if (result.copiedToClipboard) {
+      setToastMessage('Search popup blocked · Cleaned query copied to clipboard');
+    } else if (result.openedWindow) {
+      setToastMessage('Opened Google search in right window (860px)');
+    }
+    setTimeout(() => setToastMessage(null), 3000);
   }, [activeSolveQ]);
 
-  // Handle Copy for AI [C]
-  const handleCopyForAI = useCallback(() => {
+  // 4. Copy for AI Fallback [C]
+  const handleCopyForAI = useCallback(async () => {
     if (!activeSolveQ) return;
     sounds.playClick();
-    const prompt = `Please provide the definitive factual answer and a concise 1-sentence legal/GK rationale for the following multiple choice question:\n\nQuestion: ${activeSolveQ.text}\nOptions:\nA) ${activeSolveQ.options[0]}\nB) ${activeSolveQ.options[1]}\nC) ${activeSolveQ.options[2]}\nD) ${activeSolveQ.options[3]}\n\nReply format:\nAnswer: [A/B/C/D]\nRationale: [Reasoning and citation]`;
-    navigator.clipboard.writeText(prompt);
-    setCopiedToast(true);
-    setTimeout(() => setCopiedToast(false), 2000);
+    const success = await copyQuestionForAI(activeSolveQ.text, activeSolveQ.options);
+    if (success) {
+      setToastMessage('Copied raw question & 4 options for AI (LLM ready)');
+    } else {
+      setToastMessage('Failed to copy to clipboard');
+    }
+    setTimeout(() => setToastMessage(null), 2500);
   }, [activeSolveQ]);
 
   // Save Inline Edit
@@ -177,19 +254,29 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
     sounds.playCorrect();
     setIsSubmitting(true);
     const chosenLetter = ['A', 'B', 'C', 'D'][selectedOption];
+    const chosenOptionText = activeSolveQ.options[selectedOption];
 
     const success = await submitFactualAnswer(
       activeSolveQ.id,
       chosenLetter,
       activeUsername,
-      extraNotesInput
+      extraNotesInput,
+      chosenOptionText
     );
 
     if (success) {
       onCorrectAnswer();
-      setUnsolvedQueue((prev) => prev.filter((q) => q.id !== activeSolveQ.id));
       setSelectedOption(null);
       setExtraNotesInput('');
+
+      // Fetch next question via RPC get_next_question(user_name)
+      const nextQ = await fetchNextOnelinerQuestion(activeUsername);
+      if (nextQ) {
+        setUnsolvedQueue([nextQ]);
+        setCurrentSolveIndex(0);
+      } else {
+        setUnsolvedQueue((prev) => prev.filter((q) => q.id !== activeSolveQ.id));
+      }
 
       const freshLb = await fetchLiveLeaderboard(activeUsername);
       setLeaderboard(freshLb);
@@ -198,13 +285,21 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
     setIsSubmitting(false);
   }, [activeSolveQ, selectedOption, isSubmitting, activeUsername, extraNotesInput, onCorrectAnswer]);
 
-  const handleSkipSolve = useCallback(() => {
+  const handleSkipSolve = useCallback(async () => {
     sounds.playClick();
-    if (unsolvedQueue.length > 1) {
+    if (activeSolveQ) {
+      await unlockQuestion(activeSolveQ.id, activeUsername);
+    }
+    const nextQ = await fetchNextOnelinerQuestion(activeUsername);
+    if (nextQ) {
+      setUnsolvedQueue([nextQ]);
+      setCurrentSolveIndex(0);
+      setSelectedOption(null);
+    } else if (unsolvedQueue.length > 1) {
       setCurrentSolveIndex((prev) => (prev + 1) % unsolvedQueue.length);
       setSelectedOption(null);
     }
-  }, [unsolvedQueue.length]);
+  }, [activeSolveQ, activeUsername, unsolvedQueue.length]);
 
   // Sprint Mode Hardware 10-Second Timer
   useEffect(() => {
@@ -228,16 +323,20 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
     };
   }, [internalMode, sprintGameOver, activeSprintQ, sprintIndex]);
 
-  // Sprint Cooldown Timer (60s Lockout on Failure)
+  // Sprint Cooldown Timer (60s Lockout on Failure strictly via localStorage)
   useEffect(() => {
     if (cooldownSeconds > 0) {
       cooldownTimerRef.current = setInterval(() => {
         setCooldownSeconds((prev) => {
           if (prev <= 1) {
             clearInterval(cooldownTimerRef.current);
+            localStorage.removeItem(`clat_sprint_cooldown_${activeUsername}`);
             return 0;
           }
-          return prev - 1;
+          const next = prev - 1;
+          const until = Date.now() + next * 1000;
+          localStorage.setItem(`clat_sprint_cooldown_${activeUsername}`, until.toString());
+          return next;
         });
       }, 1000);
     }
@@ -245,16 +344,23 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
     return () => {
       if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
     };
-  }, [cooldownSeconds]);
+  }, [cooldownSeconds, activeUsername]);
 
   const triggerSprintOver = (wrongIdx: number | null) => {
     if (sprintTimerRef.current) clearInterval(sprintTimerRef.current);
     sounds.playIncorrect();
     setSprintWrongPicked(wrongIdx);
     setSprintGameOver(true);
-    setCooldownSeconds(60); // 60s cooldown lockout penalty
+
+    // Set 60s cooldown penalty strictly via localStorage
+    const until = Date.now() + 60000;
+    localStorage.setItem(`clat_sprint_cooldown_${activeUsername}`, until.toString());
+    localStorage.setItem(`clat_sprint_streak_${activeUsername}`, '0');
+    setSprintStreak(0);
+    setCooldownSeconds(60);
   };
 
+  // ZERO DATABASE WRITES in Sprint Mode
   const handleSprintAnswer = (idx: number) => {
     if (sprintGameOver || !activeSprintQ) return;
 
@@ -263,13 +369,26 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
       chosenLetter === (activeSprintQ.correct_answer || '').toUpperCase() ||
       idx === activeSprintQ.correctOptionIndex;
 
+    // Record lastSeenAt in localStorage for spaced repetition
+    try {
+      const saved = localStorage.getItem('clat_sprint_last_seen');
+      const map = saved ? JSON.parse(saved) : {};
+      map[activeSprintQ.id] = Date.now();
+      localStorage.setItem('clat_sprint_last_seen', JSON.stringify(map));
+    } catch {}
+
     if (isCorrect) {
       sounds.playCorrect();
       onCorrectAnswer();
       setSprintScore((prev) => prev + 100 + Math.round(sprintTimeLeft * 20));
-      setSprintStreak((prev) => prev + 1);
 
-      // Fast 70ms advance on correct pick
+      setSprintStreak((prev) => {
+        const next = prev + 1;
+        localStorage.setItem(`clat_sprint_streak_${activeUsername}`, next.toString());
+        return next;
+      });
+
+      // Fast advance on correct pick
       setTimeout(() => {
         setSprintTimeLeft(10);
         setSprintIndex((prev) => (prev + 1) % Math.max(1, solvedPool.length));
@@ -283,11 +402,16 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
     if (cooldownSeconds > 0) return;
     sounds.playClick();
     setSprintScore(0);
-    setSprintStreak(0);
     setSprintTimeLeft(10);
     setSprintGameOver(false);
     setSprintWrongPicked(null);
     setSprintIndex((prev) => (prev + 1) % Math.max(1, solvedPool.length));
+  };
+
+  const handleSelectPlaylistScope = (scope: 'all' | 'you') => {
+    sounds.playClick();
+    setSprintPlaylistScope(scope);
+    loadSolved(scope);
   };
 
   // Keyboard Shortcuts
@@ -352,17 +476,17 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 select-none">
       {/* Toast Notification */}
-      {copiedToast && (
-        <div className="fixed top-14 right-4 z-50 flex items-center gap-2 px-3 py-1.5 bg-[#050505] border border-neutral-700 text-neutral-200 text-xs rounded shadow-lg">
-          <Check className="w-3.5 h-3.5 text-emerald-400" />
-          <span>Copied prompt to clipboard</span>
+      {toastMessage && (
+        <div className="fixed top-14 right-4 z-50 flex items-center gap-2 px-3 py-1.5 bg-panel border border-border text-main text-xs rounded shadow-lg animate-in fade-in duration-150">
+          <Check className="w-3.5 h-3.5 text-accent" />
+          <span>{toastMessage}</span>
         </div>
       )}
 
       {/* Top Controls: Clean Two-Way Toggle ("Solve" | "Sprint") */}
-      <div className="flex items-center justify-between pb-3 mb-4 border-b border-neutral-800/80 text-xs">
+      <div className="flex items-center justify-between pb-3 mb-4 border-b border-border text-xs">
         <div className="flex items-center gap-2">
-          <div className="flex items-center rounded-md bg-neutral-900/80 p-0.5 border border-neutral-800">
+          <div className="flex items-center rounded-md bg-panel p-0.5 border border-border">
             <button
               onClick={() => {
                 sounds.playClick();
@@ -370,8 +494,8 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
               }}
               className={`px-3 py-1 rounded text-xs font-medium transition-all cursor-pointer ${
                 internalMode === 'solve'
-                  ? 'bg-neutral-800 text-white shadow-xs'
-                  : 'text-neutral-400 hover:text-neutral-200'
+                  ? 'bg-hover text-main shadow-xs border border-border'
+                  : 'text-muted hover:text-main'
               }`}
             >
               Solve ({unsolvedQueue.length})
@@ -383,8 +507,8 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
               }}
               className={`px-3 py-1 rounded text-xs font-medium transition-all cursor-pointer ${
                 internalMode === 'sprint'
-                  ? 'bg-neutral-800 text-white shadow-xs'
-                  : 'text-neutral-400 hover:text-neutral-200'
+                  ? 'bg-hover text-main shadow-xs border border-border'
+                  : 'text-muted hover:text-main'
               }`}
             >
               Sprint ({solvedPool.length})
@@ -392,8 +516,8 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
           </div>
         </div>
 
-        <span className="text-[11px] text-neutral-500 font-mono hidden sm:inline">
-          {internalMode === 'solve' ? 'Collaborative Verification' : 'High-Speed Training'}
+        <span className="text-[11px] text-muted font-mono hidden sm:inline">
+          {internalMode === 'solve' ? 'Collaborative Verification' : 'High-Speed Testing Engine'}
         </span>
       </div>
 
@@ -404,17 +528,17 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
       {internalMode === 'solve' ? (
         <div className="flex flex-col lg:grid lg:grid-cols-12 gap-5 items-start">
           {/* Left: Squad Stats & Feed */}
-          <aside className="w-full lg:col-span-4 bg-[#050505] border border-neutral-800/80 rounded-lg p-4 space-y-4">
-            <div className="flex items-center justify-between pb-2 border-b border-neutral-800/80 text-xs font-medium text-neutral-300">
+          <aside className="w-full lg:col-span-4 bg-panel border border-border rounded-lg p-4 space-y-4 transition-colors">
+            <div className="flex items-center justify-between pb-2 border-b border-border text-xs font-medium text-main">
               <span>Squad Leaderboard</span>
-              <span className="text-emerald-400 text-[10px] font-mono flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-accent text-[10px] font-mono flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
                 Live
               </span>
             </div>
 
             <div className="space-y-1">
-              {leaderboard.map((user, idx) => {
+              {leaderboard.map((user) => {
                 const info = SQUAD_MEMBERS[user.name as SquadMember] || SQUAD_MEMBERS.Samad;
                 const isCurrent = user.name === activeUsername;
                 return (
@@ -422,55 +546,70 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                     key={user.id}
                     className={`flex items-center justify-between p-2 rounded text-xs transition-colors ${
                       isCurrent
-                        ? 'bg-neutral-800/70 border border-neutral-700/80 text-white font-medium'
-                        : 'text-neutral-400 hover:bg-neutral-900/40'
+                        ? 'bg-hover border border-border text-main font-medium'
+                        : 'text-muted hover:bg-hover/40'
                     }`}
                   >
                     <div className="flex items-center gap-2">
                       <span className="w-2 h-2 rounded-full" style={{ backgroundColor: info.color }} />
                       <span>{user.name}</span>
-                      {isCurrent && <span className="text-neutral-500 text-[10px]">(You)</span>}
+                      {isCurrent && <span className="text-muted text-[10px]">(You)</span>}
                     </div>
-                    <div className="text-right font-mono text-[11px] text-neutral-300 tabular-nums">
+                    <div className="text-right font-mono text-[11px] text-muted tabular-nums">
                       {user.solvedCount} verified
                     </div>
                   </div>
                 );
               })}
             </div>
+
+            {/* Live Realtime Ticker */}
+            {recentTicker && (
+              <div className="pt-2 border-t border-border">
+                <div className="flex items-center justify-between text-[11px] font-mono">
+                  <span className="flex items-center gap-1.5 text-accent">
+                    <span className="w-1.5 h-1.5 rounded-full bg-accent animate-ping" />
+                    Verified: {recentTicker.questionId}
+                  </span>
+                  <span className="text-muted text-[10px]">
+                    {recentTicker.user} · {recentTicker.time}
+                  </span>
+                </div>
+              </div>
+            )}
           </aside>
 
           {/* Center: Research Workbench */}
-          <main className="w-full lg:col-span-8 bg-[#050505] border border-neutral-800/80 rounded-lg p-6 space-y-5">
+          <main className="w-full lg:col-span-8 bg-panel border border-border rounded-lg p-6 space-y-5 transition-colors">
             {activeSolveQ ? (
               <>
                 {/* Meta & Research Actions */}
-                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-neutral-800/80 text-xs">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-neutral-400 text-xs">{activeSolveQ.id}</span>
-                    <span className="text-neutral-600">·</span>
-                    <div className="flex items-center gap-1.5">
-                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
-                      <span className="text-neutral-400 text-[11px]">Pending verification</span>
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-border text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-muted text-xs break-all">{activeSolveQ.id}</span>
+                    <span className="text-muted/60 hidden xs:inline">·</span>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" />
+                      <span className="text-muted text-[11px] whitespace-normal">Pending verification</span>
                     </div>
                   </div>
 
                   <div className="flex items-center gap-2">
                     <button
                       onClick={handleSearchGoogle}
-                      className="flex items-center gap-1 px-2.5 py-1 text-neutral-400 hover:text-white border border-neutral-800 hover:border-neutral-700 rounded transition-colors cursor-pointer"
+                      className="flex items-center gap-1 px-2.5 py-1 text-muted hover:text-main border border-border hover:border-accent/50 rounded transition-colors cursor-pointer"
                       title="Search Google for factual confirmation"
                     >
-                      <Search className="w-3 h-3 text-neutral-400" />
+                      <Search className="w-3 h-3 text-muted" />
                       <span>Search [S]</span>
                     </button>
 
                     <button
                       onClick={handleCopyForAI}
-                      className="flex items-center gap-1 px-2.5 py-1 text-neutral-400 hover:text-white border border-neutral-800 hover:border-neutral-700 rounded transition-colors cursor-pointer"
+                      className="flex items-center gap-1 px-2.5 py-1 text-muted hover:text-main border border-border hover:border-accent/50 rounded transition-colors cursor-pointer"
                       title="Copy formatted prompt for AI verification"
                     >
-                      <Copy className="w-3 h-3 text-neutral-400" />
+                      <Copy className="w-3 h-3 text-muted" />
                       <span>Copy [C]</span>
                     </button>
 
@@ -478,8 +617,8 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                       onClick={() => setIsEditing((prev) => !prev)}
                       className={`p-1 rounded border transition-colors cursor-pointer ${
                         isEditing
-                          ? 'border-emerald-500 text-emerald-400 bg-neutral-900'
-                          : 'border-neutral-800 text-neutral-500 hover:text-neutral-300'
+                          ? 'border-accent text-accent bg-hover'
+                          : 'border-border text-muted hover:text-main'
                       }`}
                       title="Edit question text"
                     >
@@ -495,7 +634,7 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                       value={editText}
                       onChange={(e) => setEditText(e.target.value)}
                       rows={3}
-                      className="w-full p-3 bg-black border border-neutral-700 rounded text-sm text-neutral-100 focus:outline-none leading-relaxed"
+                      className="w-full p-3 bg-background border border-border rounded text-sm text-main focus:outline-none focus:border-accent leading-relaxed"
                     />
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       {editOptions.map((opt, idx) => (
@@ -509,20 +648,21 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                             setEditOptions(next);
                           }}
                           placeholder={`Option ${['A', 'B', 'C', 'D'][idx]}`}
-                          className="p-2 bg-black border border-neutral-800 rounded text-xs text-neutral-200"
+                          className="p-2 bg-background border border-border rounded text-xs text-main focus:outline-none focus:border-accent"
                         />
                       ))}
                     </div>
                     <div className="flex justify-end gap-2 pt-1">
                       <button
                         onClick={() => setIsEditing(false)}
-                        className="px-3 py-1 text-xs text-neutral-400 hover:text-white"
+                        className="px-3 py-1 text-xs text-muted hover:text-main"
                       >
                         Cancel
                       </button>
                       <button
                         onClick={handleSaveInlineEdit}
-                        className="px-3.5 py-1 bg-emerald-500 text-black text-xs font-medium rounded"
+                        style={{ background: 'var(--accent-gradient, var(--accent))' }}
+                        className="px-3.5 py-1 text-black text-xs font-medium rounded transition-opacity hover:opacity-90 shadow-xs"
                       >
                         Save Edits
                       </button>
@@ -530,14 +670,14 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                   </div>
                 ) : (
                   <div>
-                    <h2 className="text-base sm:text-lg font-sans font-medium text-neutral-100 leading-relaxed">
+                    <h2 className="text-base sm:text-lg font-sans font-medium text-main leading-relaxed break-words whitespace-normal">
                       {activeSolveQ.text}
                     </h2>
                   </div>
                 )}
 
                 {/* Option Buttons (A/B/C/D) */}
-                <div className="space-y-2 pt-1">
+                <div className="space-y-2.5 pt-1">
                   {activeSolveQ.options.map((opt, idx) => {
                     const letter = ['A', 'B', 'C', 'D'][idx];
                     const isPicked = selectedOption === idx;
@@ -549,25 +689,27 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                           sounds.playClick();
                           setSelectedOption(idx);
                         }}
-                        className={`w-full flex items-center justify-between p-3.5 border rounded text-left text-sm transition-all cursor-pointer ${
+                        className={`w-full flex items-center justify-between p-4 min-h-[3rem] h-auto border rounded text-left text-sm transition-all cursor-pointer ${
                           isPicked
-                            ? 'bg-neutral-800/80 border-emerald-500 text-white font-medium'
-                            : 'border-neutral-800 hover:border-neutral-700 bg-black text-neutral-300'
+                            ? 'bg-accent/15 border-accent text-main font-medium ring-1 ring-accent'
+                            : 'border-border hover:border-accent bg-background text-main'
                         }`}
                       >
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
                           <span
                             className={`w-5 h-5 rounded-xs flex items-center justify-center text-xs font-semibold shrink-0 ${
                               isPicked
-                                ? 'bg-emerald-500 text-black'
-                                : 'bg-neutral-900 text-neutral-400 border border-neutral-800'
+                                ? 'bg-accent text-black'
+                                : 'bg-hover text-muted border border-border'
                             }`}
                           >
                             {letter}
                           </span>
-                          <span className="leading-snug">{opt}</span>
+                          <span className="break-words whitespace-normal leading-relaxed text-sm">
+                            {opt}
+                          </span>
                         </div>
-                        <span className="text-xs font-mono text-neutral-500 pl-3 shrink-0">
+                        <span className="text-xs font-mono text-muted pl-3 shrink-0 hidden sm:inline tabular-nums">
                           {idx + 1}
                         </span>
                       </button>
@@ -577,7 +719,7 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
 
                 {/* Extra Notes / Verification Rationale Input */}
                 <div className="pt-2">
-                  <label className="block text-xs text-neutral-400 mb-1.5">
+                  <label className="block text-xs text-muted mb-1.5 font-sans">
                     Verification Note / Authority (Saved to database):
                   </label>
                   <textarea
@@ -585,15 +727,15 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                     onChange={(e) => setExtraNotesInput(e.target.value)}
                     placeholder="Add official gazette reference, statute citation, or verified fact..."
                     rows={2}
-                    className="w-full p-2.5 bg-black border border-neutral-800 rounded text-xs text-neutral-200 placeholder:text-neutral-600 focus:outline-none focus:border-neutral-700"
+                    className="w-full p-3 bg-background border border-border rounded text-xs text-main placeholder:text-muted/50 focus:outline-none focus:border-accent font-reading font-serif leading-relaxed"
                   />
                 </div>
 
                 {/* Submit & Skip Actions */}
-                <div className="flex items-center justify-between pt-3 border-t border-neutral-800/80 text-xs">
+                <div className="flex items-center justify-between pt-3 border-t border-border text-xs">
                   <button
                     onClick={handleSkipSolve}
-                    className="px-3 py-1.5 text-neutral-400 hover:text-white border border-neutral-800 hover:border-neutral-700 rounded transition-colors cursor-pointer"
+                    className="px-3.5 py-1.5 text-muted hover:text-main border border-border hover:border-accent/50 rounded transition-colors cursor-pointer min-h-[36px]"
                   >
                     Skip (Space)
                   </button>
@@ -601,22 +743,25 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                   <button
                     onClick={handleSubmitSolve}
                     disabled={selectedOption === null || isSubmitting}
-                    className="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-30 text-black font-medium rounded transition-colors cursor-pointer"
+                    style={{ background: 'var(--accent-gradient, var(--accent))' }}
+                    className="px-4 py-1.5 disabled:opacity-30 text-black font-medium rounded transition-opacity hover:opacity-90 cursor-pointer min-h-[36px] shadow-xs"
                   >
                     {isSubmitting ? 'Saving...' : 'Submit Answer (Enter)'}
                   </button>
                 </div>
               </>
             ) : (
-              <div className="py-16 text-center text-neutral-500 text-xs space-y-2">
-                <CheckCircle2 className="w-7 h-7 text-emerald-500 mx-auto" />
-                <div className="text-neutral-200 font-medium text-sm">All Questions Verified</div>
-                <p className="text-neutral-500 max-w-sm mx-auto">
-                  The squad has verified all pending questions. Switch to Sprint mode to test your speed.
+              <div className="py-14 text-center text-muted text-xs space-y-3">
+                <JennyMascot size="lg" variant="sleeping" className="mx-auto" />
+                <div className="text-main font-medium text-base font-sans">
+                  All Current Questions Verified!
+                </div>
+                <p className="text-muted max-w-sm mx-auto font-sans leading-relaxed">
+                  Jenny and the squad have verified all pending one-liners. Switch to Sprint mode to test your speed.
                 </p>
                 <button
                   onClick={loadUnsolved}
-                  className="mt-3 px-3 py-1 bg-neutral-900 border border-neutral-800 text-neutral-300 text-xs hover:border-neutral-700 rounded cursor-pointer"
+                  className="mt-3 px-3.5 py-1.5 bg-hover border border-border text-main text-xs hover:border-accent/50 rounded cursor-pointer min-h-[36px]"
                 >
                   Refresh Queue
                 </button>
@@ -629,18 +774,38 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
         /* B. SPRINT MODE: Testing Engine                           */
         /* (Questions where correct_answer IS NOT NULL)             */
         /* ======================================================== */
-        <div className="max-w-2xl mx-auto bg-[#050505] border border-neutral-800/80 rounded-lg p-6 sm:p-7 space-y-5">
+        <div className="max-w-2xl mx-auto bg-panel border border-border rounded-lg p-6 sm:p-7 space-y-5 transition-colors">
           {activeSprintQ ? (
             <>
-              {/* Sprint HUD: Timer, Streak, Score */}
-              <div className="flex items-center justify-between pb-3 border-b border-neutral-800/80 text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-neutral-400">
-                    Question <span className="text-white font-medium">{sprintIndex + 1}</span> of {solvedPool.length}
-                  </span>
-                  <span className="text-neutral-600">·</span>
-                  <span className="text-neutral-500 font-mono text-[11px]">
-                    Verified by {activeSprintQ.verified_by || 'Squad'}
+              {/* Sprint HUD: Scope Selector, Timer, Streak, Score */}
+              <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-border text-xs">
+                <div className="flex items-center gap-3">
+                  {/* Playlist Generation Scope: All vs You */}
+                  <div className="flex items-center rounded bg-background p-0.5 border border-border">
+                    <button
+                      onClick={() => handleSelectPlaylistScope('all')}
+                      className={`px-2 py-0.5 text-[11px] font-mono rounded-xs transition-colors cursor-pointer ${
+                        sprintPlaylistScope === 'all'
+                          ? 'bg-hover text-main font-medium border border-border'
+                          : 'text-muted hover:text-main'
+                      }`}
+                    >
+                      All
+                    </button>
+                    <button
+                      onClick={() => handleSelectPlaylistScope('you')}
+                      className={`px-2 py-0.5 text-[11px] font-mono rounded-xs transition-colors cursor-pointer ${
+                        sprintPlaylistScope === 'you'
+                          ? 'bg-hover text-main font-medium border border-border'
+                          : 'text-muted hover:text-main'
+                      }`}
+                    >
+                      You ({activeUsername})
+                    </button>
+                  </div>
+
+                  <span className="font-mono text-muted text-xs">
+                    {sprintIndex + 1} / {solvedPool.length}
                   </span>
                 </div>
 
@@ -649,7 +814,7 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                     <Flame className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
                     <span className="font-mono text-xs">{sprintStreak} streak</span>
                   </div>
-                  <div className="text-emerald-400 font-mono text-xs">
+                  <div className="text-accent font-mono text-xs font-semibold">
                     {sprintScore} pts
                   </div>
                 </div>
@@ -658,7 +823,7 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
               {/* 10-Second Hardware Timer with Color Shifts: Sky Blue > 5s, Amber 2.5-5s, Pulsing Rose < 2.5s */}
               <div>
                 <div className="flex items-center justify-between text-xs mb-1">
-                  <span className="text-neutral-500 font-mono text-[11px]">Time remaining</span>
+                  <span className="text-muted font-mono text-[11px]">Time remaining</span>
                   <span
                     className={`font-mono text-xs tabular-nums ${
                       sprintTimeLeft <= 2.5
@@ -671,7 +836,7 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                     {sprintTimeLeft.toFixed(1)}s
                   </span>
                 </div>
-                <div className="w-full h-1 bg-neutral-900 rounded-full overflow-hidden">
+                <div className="w-full h-1 bg-background border border-border rounded-full overflow-hidden">
                   <div
                     className={`h-full transition-all duration-100 ${
                       sprintTimeLeft <= 2.5
@@ -685,15 +850,15 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                 </div>
               </div>
 
-              {/* Question Text - Hero Typography */}
+              {/* Question Text - Academic Typography */}
               <div>
-                <h2 className="text-base sm:text-lg font-sans font-medium text-neutral-100 leading-relaxed">
+                <h2 className="text-base sm:text-lg font-sans font-medium text-main leading-relaxed break-words whitespace-normal">
                   {activeSprintQ.text}
                 </h2>
               </div>
 
               {/* Option Buttons */}
-              <div className="space-y-2">
+              <div className="space-y-2.5">
                 {activeSprintQ.options.map((opt, idx) => {
                   const letter = ['A', 'B', 'C', 'D'][idx];
                   const isCorrectAnswer =
@@ -701,14 +866,14 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                     idx === activeSprintQ.correctOptionIndex;
                   const isWrongPicked = sprintWrongPicked === idx;
 
-                  let borderClass = 'border-neutral-800 hover:border-neutral-700 bg-black text-neutral-200';
+                  let borderClass = 'border-border hover:border-accent bg-background text-main';
                   if (sprintGameOver) {
                     if (isCorrectAnswer) {
-                      borderClass = 'border-emerald-500 bg-emerald-950/20 text-emerald-100 font-medium';
+                      borderClass = 'border-accent bg-accent/15 text-main font-medium ring-1 ring-accent';
                     } else if (isWrongPicked) {
-                      borderClass = 'border-rose-500 bg-rose-950/20 text-rose-100';
+                      borderClass = 'border-rose-500 bg-rose-950/20 text-rose-300';
                     } else {
-                      borderClass = 'border-neutral-800/50 bg-black/40 text-neutral-500';
+                      borderClass = 'border-border/40 bg-background/40 text-muted opacity-50';
                     }
                   }
 
@@ -717,15 +882,17 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
                       key={idx}
                       onClick={() => handleSprintAnswer(idx)}
                       disabled={sprintGameOver}
-                      className={`w-full flex items-center justify-between p-3.5 border rounded text-left text-sm transition-all cursor-pointer ${borderClass}`}
+                      className={`w-full flex items-center justify-between p-4 min-h-[3rem] h-auto border rounded text-left text-sm transition-all cursor-pointer ${borderClass}`}
                     >
-                      <div className="flex items-center gap-3">
-                        <span className="w-5 h-5 rounded-xs flex items-center justify-center text-xs font-semibold border border-neutral-800 bg-neutral-900 text-neutral-400 shrink-0">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <span className="w-5 h-5 rounded-xs flex items-center justify-center text-xs font-semibold border border-border bg-hover text-muted shrink-0">
                           {letter}
                         </span>
-                        <span className="leading-snug">{opt}</span>
+                        <span className="break-words whitespace-normal leading-relaxed text-sm">
+                          {opt}
+                        </span>
                       </div>
-                      <span className="text-xs font-mono text-neutral-500 pl-3 shrink-0">
+                      <span className="text-xs font-mono text-muted pl-3 shrink-0 hidden sm:inline tabular-nums">
                         {idx + 1}
                       </span>
                     </button>
@@ -735,37 +902,42 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
 
               {/* Sudden Death Game Over & 60-Second Cooldown Penalty */}
               {sprintGameOver && (
-                <div className="p-4 bg-black border border-rose-500/70 rounded-lg space-y-3 text-xs">
+                <div className="p-4 bg-background border border-rose-500/70 rounded-lg space-y-3 text-xs">
                   <div className="flex items-center justify-between text-rose-400">
                     <div className="flex items-center gap-1.5 font-medium">
                       <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
                       <span>Sprint Ended. Answer differed from verified key.</span>
                     </div>
-                    <span className="font-mono">{sprintStreak} streak</span>
+                    <span className="font-mono tabular-nums">{sprintStreak} streak</span>
                   </div>
 
                   {activeSprintQ.extraNotes && (
-                    <div className="p-2.5 bg-neutral-950 border border-neutral-800/80 rounded text-neutral-300 text-xs">
-                      <span className="text-amber-400 font-mono text-[11px] block mb-0.5">Verification Note:</span>
-                      <p className="leading-relaxed">{activeSprintQ.extraNotes}</p>
+                    <div className="p-3 bg-panel border border-border rounded text-main text-xs">
+                      <span className="text-amber-400 font-sans font-medium text-[11px] block mb-1 uppercase tracking-wide">
+                        Verification Note:
+                      </span>
+                      <p className="font-reading font-serif text-sm leading-relaxed text-main">
+                        {activeSprintQ.extraNotes}
+                      </p>
                     </div>
                   )}
 
-                  <div className="pt-2 border-t border-neutral-800/80 flex items-center justify-between">
+                  <div className="pt-2 border-t border-border flex items-center justify-between">
                     <div>
                       {cooldownSeconds > 0 ? (
                         <span className="text-amber-400 font-mono text-xs">
                           Cooldown: {cooldownSeconds}s lockout
                         </span>
                       ) : (
-                        <span className="text-neutral-500 text-xs">Cooldown finished. Ready to retry.</span>
+                        <span className="text-muted text-xs">Cooldown finished. Ready to retry.</span>
                       )}
                     </div>
 
                     <button
                       onClick={handleRestartSprint}
                       disabled={cooldownSeconds > 0}
-                      className="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 text-black font-medium text-xs rounded transition-colors cursor-pointer"
+                      style={{ background: 'var(--accent-gradient, var(--accent))' }}
+                      className="px-4 py-1.5 disabled:opacity-30 text-black font-medium text-xs rounded transition-opacity hover:opacity-90 cursor-pointer shadow-xs"
                     >
                       {cooldownSeconds > 0 ? `Wait ${cooldownSeconds}s` : 'Try Again (Space)'}
                     </button>
@@ -774,18 +946,33 @@ export const OnelinersWorkbench: React.FC<OnelinersWorkbenchProps> = ({
               )}
             </>
           ) : (
-            <div className="py-14 text-center text-neutral-500 text-xs space-y-2">
-              <CheckCircle2 className="w-7 h-7 text-neutral-600 mx-auto" />
-              <div className="text-neutral-200 font-medium text-sm">No Verified Questions Yet</div>
-              <p className="text-neutral-500 max-w-sm mx-auto">
-                Questions must be verified in Solve mode before they appear in the Sprint test key.
+            <div className="py-14 text-center text-muted text-xs space-y-2">
+              <CheckCircle2 className="w-7 h-7 text-muted mx-auto" />
+              <div className="text-main font-medium text-sm">
+                {sprintPlaylistScope === 'you' ? `No Verified Questions by ${activeUsername}` : 'No Verified Questions Yet'}
+              </div>
+              <p className="text-muted max-w-sm mx-auto">
+                {sprintPlaylistScope === 'you'
+                  ? `You haven't verified any questions yet in Solve mode. Switch to "All" to test across the full squad playlist.`
+                  : 'Questions must be verified in Solve mode before they appear in the Sprint test key.'}
               </p>
-              <button
-                onClick={() => setInternalMode('solve')}
-                className="mt-3 px-3.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-medium rounded cursor-pointer"
-              >
-                Go to Solve Mode
-              </button>
+              <div className="pt-2 flex items-center justify-center gap-2">
+                {sprintPlaylistScope === 'you' && (
+                  <button
+                    onClick={() => handleSelectPlaylistScope('all')}
+                    className="px-3.5 py-1.5 bg-hover hover:opacity-90 text-main text-xs font-medium rounded cursor-pointer border border-border"
+                  >
+                    Switch to All
+                  </button>
+                )}
+                <button
+                  onClick={() => setInternalMode('solve')}
+                  style={{ background: 'var(--accent-gradient, var(--accent))' }}
+                  className="px-3.5 py-1.5 text-black text-xs font-medium rounded cursor-pointer shadow-xs hover:opacity-90"
+                >
+                  Go to Solve Mode
+                </button>
+              </div>
             </div>
           )}
         </div>

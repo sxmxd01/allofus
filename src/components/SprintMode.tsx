@@ -24,7 +24,7 @@ import {
   recordUserAttempt,
   fetchLiveLeaderboard,
 } from '../lib/clatService';
-import { supabase } from '../lib/supabase';
+import { supabaseOneliners } from '../lib/supabase';
 
 interface SprintModeProps {
   activeUsername: string;
@@ -75,11 +75,11 @@ export const SprintMode: React.FC<SprintModeProps> = ({
 
   // 2. Real-time Subscription to user_attempts table to update live leaderboard instantly
   useEffect(() => {
-    const channel = supabase
+    const channel = supabaseOneliners
       .channel('realtime:user_attempts:sprint')
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'user_attempts' },
+        { event: '*', schema: 'public', table: 'questions' },
         async () => {
           const freshLb = await fetchLiveLeaderboard(activeUsername);
           setLeaderboard(freshLb);
@@ -88,7 +88,7 @@ export const SprintMode: React.FC<SprintModeProps> = ({
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      supabaseOneliners.removeChannel(channel);
     };
   }, [activeUsername]);
 

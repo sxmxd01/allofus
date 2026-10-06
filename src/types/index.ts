@@ -1,8 +1,31 @@
+export type AppTheme = 'default' | 'mono' | 'jade' | 'cupid';
+
+export interface UserProfile {
+  id: string;
+  username: string;
+  display_name: string;
+  avatar_url?: string;
+  passcode: string;
+  theme: AppTheme;
+  created_at?: string;
+}
+
 export type SubjectType = 'gk' | 'quants' | 'analytical';
 
-export type GKSubTab = 'topics' | 'qb' | 'oneliners';
+export type GKSubTab = 'topics' | 'qb' | 'oneliners' | 'dump';
+export type QTSubTab = 'drill' | 'mental_math';
 
-export type TabType = GKSubTab | string;
+export type TabType = GKSubTab | QTSubTab | string;
+
+export * from './mentalMath';
+
+export interface LiveDumpItem {
+  id: string;
+  user_name: string;
+  tag: string;
+  content: string;
+  created_at: string;
+}
 
 export type SquadMember = 'Avni' | 'Sadvitha' | 'Samad' | 'Shourya';
 
@@ -61,7 +84,7 @@ export interface LeaderboardUser {
   color?: string;
 }
 
-export type QuestionDifficulty = 'Easy' | 'Moderate' | 'Hard';
+export type QuestionDifficulty = 'Very Easy' | 'Easy' | 'Moderate' | 'Hard';
 
 export interface BankQuestion {
   id: string;
@@ -78,6 +101,7 @@ export interface BankQuestion {
   passageId?: string;
   isVerified: boolean;
   type?: 'mocks' | 'current';
+  sourceType?: 'mocks' | 'current';
   extraNotes?: string;
   lastAttemptedAt?: string;
   lockedBy?: string | null;
@@ -106,6 +130,7 @@ export interface Passage {
   wordCount: number;
   readTimeMinutes: number;
   text: string;
+  solution_video_url?: string;
   tableData?: { headers: string[]; rows: (string | number)[][] };
   questions: PassageQuestion[];
 }

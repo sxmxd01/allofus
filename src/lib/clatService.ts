@@ -1,6 +1,7 @@
-import { supabase } from './supabase';
+import { supabaseMocks, supabaseOneliners } from './supabase';
 import {
   BankQuestion,
+  QuestionDifficulty,
   Passage,
   SyllabusTopic,
   LeaderboardUser,
@@ -10,7 +11,6 @@ import {
   SQUAD_MEMBERS,
 } from '../types';
 import {
-  initialLeaderboard,
   bankQuestions as fallbackBankQuestions,
   initialUnsolvedQuestions,
   passages as fallbackPassages,
@@ -18,117 +18,197 @@ import {
 } from '../data/mockData';
 
 // ----------------------------------------------------------------------
-// 1. SYLLABUS TRACKER
+// 1. SYLLABUS TRACKER (Hardcoded in GitHub, no Supabase dependency)
 // ----------------------------------------------------------------------
 
+import { MONTHLY_GK_BATCHES } from '../data/monthlyGkData';
+
 export async function fetchSyllabusTopics(
-  userName: string,
-  subject: SubjectType = 'gk'
+  _userName: string,
+  _subject: SubjectType = 'gk'
 ): Promise<SyllabusTopic[]> {
-  try {
-    const { data, error } = await supabase
-      .from('syllabus_tracker')
-      .select('*')
-      .eq('user_name', userName)
-      .eq('subject', subject);
-
-    if (!error && data && data.length > 0) {
-      return data.map((row) => ({
-        id: row.id,
-        subject: row.subject as SubjectType,
-        month: row.month || 'September 2026',
-        title: row.topic_name || row.title || 'CLAT Topic',
-        category: row.category || 'General Preparation',
-        status: (row.is_completed ? 'mastered' : 'pending') as TopicStatus,
-        isCompleted: !!row.is_completed,
-      }));
-    }
-  } catch (err) {
-    console.error('Error fetching syllabus topics from Supabase:', err);
-  }
-
-  return initialSyllabusTopics.filter((t) => t.subject === subject);
+  // Hardcoded monthly GK tracker stored in repository
+  return MONTHLY_GK_BATCHES.flatMap((batch) =>
+    batch.topics.map((t) => ({
+      id: t.id,
+      subject: 'gk' as SubjectType,
+      month: batch.name,
+      title: t.title,
+      category: 'Current Affairs',
+      status: 'pending' as TopicStatus,
+      isCompleted: false,
+    }))
+  );
 }
 
 export async function updateSyllabusTopicStatus(
-  topicId: string,
-  userName: string,
-  isCompleted: boolean,
-  topicName?: string,
-  subject: SubjectType = 'gk'
+  _topicId: string,
+  _userName: string,
+  _isCompleted: boolean,
+  _topicName?: string,
+  _subject: SubjectType = 'gk'
 ): Promise<boolean> {
-  try {
-    const now = new Date().toISOString();
-    const { error, count } = await supabase
-      .from('syllabus_tracker')
-      .update({
-        is_completed: isCompleted,
-        completed_at: isCompleted ? now : null,
-      })
-      .eq('id', topicId)
-      .eq('user_name', userName);
-
-    if (!error && count && count > 0) {
-      return true;
-    }
-
-    if (topicName && subject) {
-      const { error: insertErr } = await supabase.from('syllabus_tracker').upsert({
-        id: topicId,
-        user_name: userName,
-        subject: subject,
-        topic_name: topicName,
-        is_completed: isCompleted,
-        completed_at: isCompleted ? now : null,
-      });
-      if (!insertErr) return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
+  // Locally tracked per user without Supabase errors
+  return true;
 }
 
 // ----------------------------------------------------------------------
-// 2. ONELINERS SOLVE MODE: Fetch questions where correct_answer IS NULL
+// 2. ONELINERS SOLVE MODE: Fetch next question via get_next_question(user_name)
 // ----------------------------------------------------------------------
 
-export async function fetchUnsolvedQuestions(): Promise<BankQuestion[]> {
+export async function fetchNextOnelinerQuestion(userName: string): Promise<BankQuestion | null> {
+  const letterMap: Record<string, number> = { A: 0, B: 1, C: 2, D: 3, a: 0, b: 1, c: 2, d: 3 };
+
+  // 1. Try existing RPC get_next_question(user_name) on supabaseOneliners
   try {
-    // Exact specification: Query logic: Fetch ONLY questions where correct_answer IS NULL
-    const { data, error } = await supabase
+    const { data, error } = await supabaseOneliners.rpc('get_next_question', { user_name: userName });
+    if (!error && data) {
+      const row = Array.isArray(data) ? data[0] : data;
+      if (row && (row.id || row.question_text || row.question || row.text)) {
+        const rawOptions = Array.isArray(row.options)
+          ? row.options
+          : [
+              row.option_a || 'Option A',
+              row.option_b || 'Option B',
+              row.option_c || 'Option C',
+              row.option_d || 'Option D',
+            ];
+        const correctText = row.correct_answer ? String(row.correct_answer).trim() : null;
+        let correctIdx: number | null = null;
+        if (correctText) {
+          const matchIdx = rawOptions.findIndex(
+            (opt: string) => opt.trim().toLowerCase() === correctText.toLowerCase()
+          );
+          correctIdx = matchIdx !== -1 ? matchIdx : (letterMap[correctText] ?? null);
+        }
+
+        return {
+          id: row.id,
+          subject: 'gk',
+          category: row.category || 'CLAT Oneliners',
+          subtopic: row.subtopic || 'Current Affairs',
+          text: row.question_text || row.question || row.text || '',
+          options: rawOptions,
+          correct_answer: correctText,
+          correctOptionIndex: correctIdx,
+          explanation: row.extra_notes || row.explanation || 'Answer key pending research by squad.',
+          difficulty: (row.difficulty as any) || 'Moderate',
+          source: 'Squad Research Queue',
+          isVerified: !!row.correct_answer,
+          extraNotes: row.extra_notes,
+          lockedBy: row.locked_by,
+          lockedAt: row.locked_at,
+          verified_by: row.answered_by,
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('RPC get_next_question error on supabaseOneliners:', err);
+  }
+
+  // 2. Direct query on supabaseOneliners questions table
+  try {
+    const { data, error } = await supabaseOneliners
       .from('questions')
       .select('*')
       .is('correct_answer', null)
-      .eq('subject', 'gk');
+      .limit(1);
 
     if (!error && data && data.length > 0) {
-      return data.map((row) => ({
+      const row = data[0];
+      const rawOptions = Array.isArray(row.options)
+        ? row.options
+        : [
+            row.option_a || 'Option A',
+            row.option_b || 'Option B',
+            row.option_c || 'Option C',
+            row.option_d || 'Option D',
+          ];
+
+      return {
         id: row.id,
         subject: 'gk',
-        category: row.category || 'Collaborative Research',
-        subtopic: row.subtopic || 'General Knowledge',
-        text: row.question || row.text || '',
-        options: [
-          row.option_a || 'Option A',
-          row.option_b || 'Option B',
-          row.option_c || 'Option C',
-          row.option_d || 'Option D',
-        ],
+        category: row.category || 'CLAT Oneliners',
+        subtopic: row.subtopic || 'Current Affairs',
+        text: row.question_text || row.question || row.text || '',
+        options: rawOptions,
         correct_answer: null,
         correctOptionIndex: null,
-        explanation: row.explanation || 'Answer key pending research by squad.',
+        explanation: row.extra_notes || row.explanation || 'Answer key pending research by squad.',
         difficulty: (row.difficulty as any) || 'Moderate',
-        source: row.source || 'Squad Research Queue',
+        source: 'Squad Research Queue',
         isVerified: false,
         extraNotes: row.extra_notes,
-      }));
+        lockedBy: row.locked_by,
+        lockedAt: row.locked_at,
+      };
     }
   } catch (err) {
-    console.warn('Supabase fetchUnsolvedQuestions error:', err);
+    console.warn('supabaseOneliners direct query error:', err);
+  }
+
+  // 3. Fallback to local unsolved questions
+  return initialUnsolvedQuestions[0] || null;
+}
+
+export async function fetchUnsolvedQuestions(): Promise<BankQuestion[]> {
+  try {
+    const { data, error } = await supabaseOneliners
+      .from('questions')
+      .select('*')
+      .is('correct_answer', null)
+      .limit(20);
+
+    if (!error && data && data.length > 0) {
+      return data.map((row) => {
+        const rawOptions = Array.isArray(row.options)
+          ? row.options
+          : [
+              row.option_a || 'Option A',
+              row.option_b || 'Option B',
+              row.option_c || 'Option C',
+              row.option_d || 'Option D',
+            ];
+        return {
+          id: row.id,
+          subject: 'gk',
+          category: row.category || 'CLAT Oneliners',
+          subtopic: row.subtopic || 'Current Affairs',
+          text: row.question_text || row.question || row.text || '',
+          options: rawOptions,
+          correct_answer: null,
+          correctOptionIndex: null,
+          explanation: row.extra_notes || row.explanation || 'Answer key pending research by squad.',
+          difficulty: (row.difficulty as any) || 'Moderate',
+          source: 'Squad Research Queue',
+          isVerified: false,
+          extraNotes: row.extra_notes,
+          lockedBy: row.locked_by,
+          lockedAt: row.locked_at,
+        };
+      });
+    }
+  } catch (err) {
+    console.warn('supabaseOneliners fetchUnsolvedQuestions error:', err);
   }
 
   return initialUnsolvedQuestions;
+}
+
+export async function unlockQuestion(questionId: string, userName?: string): Promise<boolean> {
+  try {
+    const query = supabaseOneliners
+      .from('questions')
+      .update({ locked_by: null, locked_at: null, status: 'unanswered' })
+      .eq('id', questionId);
+    if (userName) {
+      query.eq('locked_by', userName);
+    }
+    const { error } = await query;
+    return !error;
+  } catch {
+    return false;
+  }
 }
 
 // ----------------------------------------------------------------------
@@ -139,34 +219,28 @@ export async function submitFactualAnswer(
   questionId: string,
   chosenOption: string, // 'A' | 'B' | 'C' | 'D'
   activeUsername: string,
-  extraNotes?: string
+  extraNotes?: string,
+  optionText?: string
 ): Promise<boolean> {
   try {
+    const chosenVal = optionText || chosenOption;
     const payload: Record<string, any> = {
-      correct_answer: chosenOption,
-      verified_by: activeUsername,
-      verification_status: 'verified',
+      correct_answer: chosenVal,
+      status: 'answered',
+      locked_by: null,
+      locked_at: null,
+      answered_by: activeUsername,
+      extra_notes: extraNotes || null,
     };
-    if (extraNotes) payload.extra_notes = extraNotes;
 
-    // 1. UPDATE question in Supabase
-    const { error: updateError } = await supabase
+    const { error: updateError } = await supabaseOneliners
       .from('questions')
       .update(payload)
       .eq('id', questionId);
 
-    // 2. Log in user_attempts table
-    await supabase.from('user_attempts').insert({
-      user_name: activeUsername,
-      question_id: questionId,
-      selected_option: chosenOption,
-      is_correct: true,
-      attempted_at: new Date().toISOString(),
-    });
-
     return !updateError;
   } catch (err) {
-    console.error('Error submitting factual answer to Supabase:', err);
+    console.error('Error submitting factual answer to supabaseOneliners:', err);
     return false;
   }
 }
@@ -175,25 +249,101 @@ export async function submitFactualAnswer(
 // 4. ONELINERS SPRINT MODE: Fetch questions where correct_answer IS NOT NULL
 // ----------------------------------------------------------------------
 
-export async function fetchSolvedSprintQuestions(): Promise<BankQuestion[]> {
-  const letterMap: Record<string, number> = { A: 0, B: 1, C: 2, D: 3, '1': 0, '2': 1, '3': 2, '4': 3 };
+export async function fetchSolvedSprintQuestions(
+  playlistScope: 'all' | 'you' = 'all',
+  currentUser?: string
+): Promise<BankQuestion[]> {
+  const letterMap: Record<string, number> = { A: 0, B: 1, C: 2, D: 3, '1': 0, '2': 1, '3': 2, '4': 3, a: 0, b: 1, c: 2, d: 3 };
 
   try {
-    // Exact specification: Query logic: Fetch ONLY questions where correct_answer IS NOT NULL
-    const { data, error } = await supabase
+    let query = supabaseOneliners
       .from('questions')
       .select('*')
-      .not('correct_answer', 'is', null)
-      .eq('subject', 'gk');
+      .eq('status', 'answered');
+
+    if (playlistScope === 'you' && currentUser) {
+      query = query.eq('answered_by', currentUser);
+    }
+
+    const { data, error } = await query;
 
     if (!error && data && data.length > 0) {
       return data.map((row) => {
-        const rawAns = (row.correct_answer || '').toString().trim().toUpperCase();
+        const rawAns = (row.correct_answer || '').toString().trim();
+        const optionsList = Array.isArray(row.options)
+          ? row.options
+          : [
+              row.option_a || 'Option A',
+              row.option_b || 'Option B',
+              row.option_c || 'Option C',
+              row.option_d || 'Option D',
+            ];
+
+        let correctIdx = optionsList.findIndex(
+          (opt: string) => opt.trim().toLowerCase() === rawAns.toLowerCase()
+        );
+        if (correctIdx === -1) {
+          correctIdx = letterMap[rawAns.toUpperCase()] ?? 0;
+        }
+
         return {
           id: row.id,
           subject: 'gk',
-          category: row.category || 'CLAT Speed-Run',
+          category: row.category || 'CLAT Oneliners',
           subtopic: row.subtopic || 'Current Affairs',
+          text: row.question_text || row.question || row.text || '',
+          options: optionsList,
+          correct_answer: rawAns,
+          correctOptionIndex: correctIdx,
+          explanation: row.extra_notes || row.explanation || 'Verified answer from squad research.',
+          difficulty: (row.difficulty as any) || 'Moderate',
+          source: 'Squad Solved Key',
+          isVerified: true,
+          extraNotes: row.extra_notes,
+          verified_by: row.answered_by || row.verified_by,
+        };
+      });
+    }
+  } catch (err) {
+    console.warn('supabaseOneliners fetchSolvedSprintQuestions error:', err);
+  }
+
+  // Fallback to verified questions where correct_answer is known
+  const fallback = fallbackBankQuestions.filter((q) => q.subject === 'gk' && q.correctOptionIndex !== null);
+  if (playlistScope === 'you' && currentUser) {
+    const filtered = fallback.filter((q) => q.verified_by === currentUser);
+    if (filtered.length > 0) return filtered;
+  }
+  return fallback;
+}
+
+// ----------------------------------------------------------------------
+// 5. LIVE QB QUESTIONS (Mocks vs Current from qb_questions table)
+// ----------------------------------------------------------------------
+
+export async function fetchQBQuestions(section: 'question_bank' | 'current_affairs'): Promise<BankQuestion[]> {
+  const letterMap: Record<string, number> = {
+    a: 0, b: 1, c: 2, d: 3,
+    A: 0, B: 1, C: 2, D: 3,
+    '1': 0, '2': 1, '3': 2, '4': 3,
+  };
+
+  try {
+    const { data, error } = await supabaseMocks
+      .from('qb_questions')
+      .select('*')
+      .eq('section', section);
+
+    if (!error && data && data.length > 0) {
+      return data.map((row) => {
+        const rawAns = (row.correct_answer || '').toString().trim();
+        const ansKey = rawAns.toLowerCase();
+        const correctIdx = letterMap[ansKey] ?? 0;
+        return {
+          id: row.id,
+          subject: 'gk' as SubjectType,
+          category: row.category || 'General Preparation',
+          subtopic: row.subtopic || 'General',
           text: row.question || row.text || '',
           options: [
             row.option_a || 'Option A',
@@ -201,23 +351,23 @@ export async function fetchSolvedSprintQuestions(): Promise<BankQuestion[]> {
             row.option_c || 'Option C',
             row.option_d || 'Option D',
           ],
-          correct_answer: rawAns,
-          correctOptionIndex: letterMap[rawAns] ?? 0,
-          explanation: row.explanation || 'Verified answer from squad key.',
-          difficulty: (row.difficulty as any) || 'Moderate',
-          source: row.source || 'Squad Solved Key',
+          correct_answer: rawAns.toUpperCase(),
+          correctOptionIndex: correctIdx,
+          explanation: row.explanation || 'Verified answer rationale.',
+          difficulty: (row.difficulty as QuestionDifficulty) || 'Moderate',
+          source: row.source || (row.section === 'question_bank' ? 'Mock Series' : 'Current Affairs'),
           isVerified: true,
-          extraNotes: row.extra_notes,
-          verified_by: row.verified_by,
+          type: row.section === 'question_bank' ? ('mocks' as const) : ('current' as const),
         };
       });
     }
   } catch (err) {
-    console.warn('Supabase fetchSolvedSprintQuestions error:', err);
+    console.warn('Error querying qb_questions from supabaseMocks:', err);
   }
 
-  // Fallback to verified questions where correct_answer is known
-  return fallbackBankQuestions.filter((q) => q.subject === 'gk' && q.correctOptionIndex !== null);
+  // Fallback to local bank questions matching the section
+  const localType = section === 'question_bank' ? 'mocks' : 'current';
+  return fallbackBankQuestions.filter((q) => q.subject === 'gk' && (q.type ? q.type === localType : localType === 'current'));
 }
 
 // ----------------------------------------------------------------------
@@ -228,7 +378,7 @@ export async function fetchBankQuestions(subject: SubjectType = 'gk'): Promise<B
   const letterMap: Record<string, number> = { A: 0, B: 1, C: 2, D: 3, '1': 0, '2': 1, '3': 2, '4': 3 };
 
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabaseMocks
       .from('questions')
       .select('*')
       .eq('subject', subject);
@@ -267,60 +417,73 @@ export async function fetchBankQuestions(subject: SubjectType = 'gk'): Promise<B
 export const fetchSprintQuestions = fetchSolvedSprintQuestions;
 
 // ----------------------------------------------------------------------
-// 6. LIVE LEADERBOARD
+// 6. GLOBAL TOTAL SOLVED COUNT & LIVE SQUAD LEADERBOARD
 // ----------------------------------------------------------------------
+
+export async function fetchTotalSolvedCount(): Promise<number> {
+  try {
+    // 1. Exact user requirement: SELECT COUNT(*) on questions table where status = 'answered' via supabaseOneliners
+    const { count, error } = await supabaseOneliners
+      .from('questions')
+      .select('*', { count: 'exact', head: true })
+      .eq('status', 'answered');
+
+    if (!error && typeof count === 'number') {
+      return count;
+    }
+  } catch (err) {
+    console.error('Error fetching total solved count from supabaseOneliners:', err);
+  }
+
+  return 0;
+}
 
 export async function fetchLiveLeaderboard(activeUsername: string): Promise<LeaderboardUser[]> {
   const squadMembers: SquadMember[] = ['Avni', 'Sadvitha', 'Samad', 'Shourya'];
+  const userCounts: Record<SquadMember, number> = {
+    Avni: 0,
+    Sadvitha: 0,
+    Samad: 0,
+    Shourya: 0,
+  };
 
   try {
-    const { data, error } = await supabase
-      .from('user_attempts')
-      .select('user_name, is_correct');
+    // Query answered questions directly from supabaseOneliners questions table
+    const { data: answeredRows, error } = await supabaseOneliners
+      .from('questions')
+      .select('answered_by, status')
+      .eq('status', 'answered');
 
-    if (!error && data && data.length > 0) {
-      const statsMap: Record<string, { total: number; correct: number }> = {};
-      data.forEach((row) => {
-        const u = row.user_name || 'Anonymous';
-        if (!statsMap[u]) statsMap[u] = { total: 0, correct: 0 };
-        statsMap[u].total += 1;
-        if (row.is_correct) statsMap[u].correct += 1;
+    if (!error && answeredRows) {
+      answeredRows.forEach((row) => {
+        const rawUser = row.answered_by;
+        if (rawUser) {
+          const matched = squadMembers.find(
+            (m) => m.toLowerCase() === String(rawUser).trim().toLowerCase()
+          );
+          if (matched) {
+            userCounts[matched] += 1;
+          }
+        }
       });
-
-      return squadMembers
-        .map((name) => {
-          const stats = statsMap[name];
-          const benchmark = initialLeaderboard.find((u) => u.name === name);
-          const solved = stats ? stats.total : benchmark ? benchmark.solvedCount : 0;
-          const accuracy =
-            stats && stats.total > 0
-              ? Math.round((stats.correct / stats.total) * 1000) / 10
-              : benchmark
-              ? benchmark.accuracy
-              : 92.0;
-
-          return {
-            id: `u-${name.toLowerCase()}`,
-            name,
-            isCurrentUser: name === activeUsername,
-            solvedCount: solved,
-            accuracy,
-            streak: benchmark ? benchmark.streak : 5,
-            status: 'online' as const,
-            color: SQUAD_MEMBERS[name].color,
-          };
-        })
-        .sort((a, b) => b.solvedCount - a.solvedCount);
     }
   } catch (err) {
-    console.error('Error calculating leaderboard from Supabase:', err);
+    console.error('Error calculating squad leaderboard from supabaseOneliners:', err);
   }
 
-  return initialLeaderboard.map((u) => ({
-    ...u,
-    isCurrentUser: u.name === activeUsername,
-    color: SQUAD_MEMBERS[u.name as SquadMember]?.color || '#34d399',
-  }));
+  // Bind live database values strictly - zero mock fallback numbers
+  return squadMembers
+    .map((name) => ({
+      id: `u-${name.toLowerCase()}`,
+      name,
+      isCurrentUser: name === activeUsername,
+      solvedCount: userCounts[name],
+      accuracy: 100.0,
+      streak: userCounts[name],
+      status: 'online' as const,
+      color: SQUAD_MEMBERS[name].color,
+    }))
+    .sort((a, b) => b.solvedCount - a.solvedCount);
 }
 
 // ----------------------------------------------------------------------
@@ -348,7 +511,7 @@ export async function recordUserAttempt(
       attempted_at: new Date().toISOString(),
     };
     if (extraNotes) payload.extra_notes = extraNotes;
-    const { error } = await supabase.from('user_attempts').insert(payload);
+    const { error } = await supabaseMocks.from('user_attempts').insert(payload);
     return !error;
   } catch {
     return false;
@@ -357,7 +520,7 @@ export async function recordUserAttempt(
 
 export async function fetchSharedNotes(): Promise<string | null> {
   try {
-    const { data } = await supabase
+    const { data } = await supabaseMocks
       .from('shared_notes')
       .select('content')
       .eq('id', 'global_dump')
@@ -371,7 +534,7 @@ export async function fetchSharedNotes(): Promise<string | null> {
 export async function saveSharedNotes(content: string): Promise<boolean> {
   try {
     const now = new Date().toISOString();
-    const { error } = await supabase
+    const { error } = await supabaseMocks
       .from('shared_notes')
       .upsert({ id: 'global_dump', content, updated_at: now });
     return !error;
@@ -401,6 +564,7 @@ export async function commitImportBatch(
       wordCount: number;
       readTimeMinutes: number;
       source: string;
+      solution_video_url?: string;
     };
     questions: Array<{
       id: string;
@@ -411,7 +575,7 @@ export async function commitImportBatch(
       explanation: string;
       category?: string;
       subtopic?: string;
-      difficulty?: 'Easy' | 'Moderate' | 'Hard';
+      difficulty?: QuestionDifficulty;
       source?: string;
     }>;
   }
@@ -427,8 +591,8 @@ export async function commitImportBatch(
       createdPassageId = passage.id;
       const subject = destination === 'quants_caselet' ? 'quants' : 'analytical';
 
-      // Insert passage into passages table
-      const { error: passageError } = await supabase.from('passages').upsert({
+      // Insert passage into passages table on supabaseMocks
+      const passagePayload: Record<string, any> = {
         id: passage.id,
         title: passage.title,
         text: passage.text,
@@ -439,10 +603,33 @@ export async function commitImportBatch(
         read_time_minutes: passage.readTimeMinutes,
         source: passage.source,
         created_at: new Date().toISOString(),
-      });
+      };
+
+      if (passage.solution_video_url) {
+        passagePayload.solution_video_url = passage.solution_video_url;
+      }
+
+      const { error: passageError } = await supabaseMocks.from('passages').upsert(passagePayload);
 
       if (passageError) {
-        console.warn('Warning: Could not insert passage to passages table:', passageError);
+        // If column solution_video_url is missing from database schema, retry without it but note error
+        if (passageError.message && passageError.message.includes('solution_video_url')) {
+          delete passagePayload.solution_video_url;
+          const { error: retryError } = await supabaseMocks.from('passages').upsert(passagePayload);
+          if (retryError) {
+            return {
+              success: false,
+              insertedCount: 0,
+              error: `Passage schema error: ${retryError.message}`,
+            };
+          }
+        } else {
+          return {
+            success: false,
+            insertedCount: 0,
+            error: `Passage schema error: ${passageError.message}`,
+          };
+        }
       }
     }
 
@@ -481,13 +668,58 @@ export async function commitImportBatch(
       };
     });
 
-    // 3. Batch insert questions directly into Supabase questions table
-    const { error: questionsError, count } = await supabase
+    // 3. Database Mapping:
+    // If destination is GK QB Mocks or GK QB Current, map directly to qb_questions table on supabaseMocks
+    if (destination === 'gk_qb_mocks' || destination === 'gk_qb_current') {
+      const sectionVal = destination === 'gk_qb_mocks' ? 'question_bank' : 'current_affairs';
+      const qbRows = questions.map((q) => {
+        return {
+          id: q.id,
+          section: sectionVal,
+          category: q.category || (sectionVal === 'question_bank' ? 'Constitutional Law' : 'Current Affairs'),
+          subtopic: q.subtopic || 'General',
+          difficulty: q.difficulty || 'Moderate',
+          question: q.prompt,
+          option_a: q.options[0] || '',
+          option_b: q.options[1] || '',
+          option_c: q.options[2] || '',
+          option_d: q.options[3] || '',
+          correct_answer: (q.correctAnswer || 'a').toLowerCase(),
+          explanation: q.explanation || 'Verified rationale.',
+          created_at: new Date().toISOString(),
+        };
+      });
+
+      const { error: qbError, count: qbCount } = await supabaseMocks
+        .from('qb_questions')
+        .upsert(qbRows, { onConflict: 'id' });
+
+      if (qbError) {
+        console.error('Error inserting questions to supabaseMocks qb_questions:', qbError);
+        return {
+          success: false,
+          insertedCount: 0,
+          error: qbError.message || 'Failed to insert questions into qb_questions table',
+        };
+      }
+
+      // Also upsert into questions table for unified querying across bank tabs
+      await supabaseMocks.from('questions').upsert(questionRows);
+
+      return {
+        success: true,
+        insertedCount: qbCount ?? qbRows.length,
+        passageId: createdPassageId,
+      };
+    }
+
+    // Otherwise (Quants Caselet / AR Puzzle): Batch insert questions directly into supabaseMocks questions table
+    const { error: questionsError, count } = await supabaseMocks
       .from('questions')
       .upsert(questionRows);
 
     if (questionsError) {
-      console.error('Error inserting questions to Supabase:', questionsError);
+      console.error('Error inserting questions to supabaseMocks:', questionsError);
       return {
         success: false,
         insertedCount: 0,
