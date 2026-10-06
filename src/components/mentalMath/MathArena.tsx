@@ -6,11 +6,14 @@ import {
   getUserMentalMathStats,
   saveUserMentalMathStats,
 } from '../../lib/dualSupabase';
-import { getLevelMetadata } from '../../utils/mentalMathParser';
-import { getLocalSetsForLevel, getParsedMentalMath } from '../../utils/parseMentalMath';
+import {
+  getLevelMetadata,
+  getLocalSetsForLevel,
+  getParsedMentalMath,
+} from '../../utils/parseMentalMath';
 import { PostMortemReview } from './PostMortemReview';
 import { sounds } from '../../utils/sound';
-import { Zap, Award, Flame, ArrowRight, RotateCcw, Volume2, VolumeX, Upload } from 'lucide-react';
+import { Zap, Award, ArrowRight, RotateCcw, AlertTriangle } from 'lucide-react';
 
 interface MathArenaProps {
   levelNumber: number;
@@ -35,6 +38,10 @@ export const MathArena: React.FC<MathArenaProps> = ({
   onExitZen,
   onLevelAdvanced,
 }) => {
+  // Curriculum Fatal Check on load
+  const parsedData = getParsedMentalMath();
+  const fatalError = parsedData.fatalError;
+
   const [levelNumber, setLevelNumber] = useState(initialLevelNumber);
   const [sets, setSets] = useState<MathSet[]>([]);
   const [currentSetIndex, setCurrentSetIndex] = useState(0);
@@ -63,18 +70,19 @@ export const MathArena: React.FC<MathArenaProps> = ({
   const inputRef = useRef<HTMLInputElement>(null);
   const timerIntervalRef = useRef<any>(null);
 
-  // Synchronous State Machine Refs to completely eliminate off-by-one race conditions
+  // Synchronous State Machine Refs
   const currentQIndexRef = useRef(0);
   const currentSetRef = useRef<MathSet | undefined>(undefined);
   const isEvaluatingRef = useRef(false);
 
-  // Keep refs synchronized with active state
   useEffect(() => {
     currentQIndexRef.current = currentQIndex;
   }, [currentQIndex]);
 
   // 1. Load Sets for Level from hardcoded local content
   useEffect(() => {
+    if (fatalError) return;
+
     const availableSets = getLocalSetsForLevel(levelNumber);
 
     if (!availableSets || availableSets.length === 0) {
@@ -114,12 +122,11 @@ export const MathArena: React.FC<MathArenaProps> = ({
     setMaxTimeAllowed(limit);
     setScreenState('playing');
     setQuestionStartTime(Date.now());
-  }, [levelNumber, initialSetNumber, activeUsername]);
+  }, [levelNumber, initialSetNumber, activeUsername, fatalError]);
 
   const currentSet: MathSet | undefined = sets[currentSetIndex];
   const currentQ: MathQuestion | undefined = currentSet?.questions[currentQIndex];
 
-  // Keep currentSetRef in sync whenever sets or currentSetIndex changes
   useEffect(() => {
     if (sets[currentSetIndex]) {
       currentSetRef.current = sets[currentSetIndex];
@@ -131,7 +138,6 @@ export const MathArena: React.FC<MathArenaProps> = ({
     if (isEvaluatingRef.current) return;
     isEvaluatingRef.current = true;
 
-    // Capture the EXACT question index and question synchronously
     const targetIdx = currentQIndexRef.current;
     const activeSet = currentSetRef.current;
     const targetQ = activeSet?.questions[targetIdx];
@@ -147,7 +153,6 @@ export const MathArena: React.FC<MathArenaProps> = ({
     sounds.playIncorrect();
     const timeSpent = Date.now() - questionStartTime;
 
-    // Clear input field synchronously
     if (inputRef.current) inputRef.current.value = '';
     setInputValue('');
 
@@ -169,7 +174,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
     };
     logMentalMathAttempt(logItem);
 
-    // Drop immediately into Post-Mortem Review on the EXACT question
+    // Halt immediately and go to Post-Mortem Review on the EXACT question
     setFailedQuestions([
       {
         question: targetQ,
@@ -187,7 +192,6 @@ export const MathArena: React.FC<MathArenaProps> = ({
       return;
     }
 
-    // Clean 1-second interval to eliminate main thread chop
     timerIntervalRef.current = setInterval(() => {
       setTimeLeft((prev) => {
         if (prev <= 1) {
@@ -204,21 +208,19 @@ export const MathArena: React.FC<MathArenaProps> = ({
     };
   }, [screenState, currentQIndex, currentSetIndex, handleTimeout, currentQ]);
 
-  // Keep input focused at all times in Zen Mode
+  // Keep input focused in Zen Mode
   useEffect(() => {
     if (screenState === 'playing') {
       inputRef.current?.focus();
     }
   }, [screenState, currentQIndex, currentSetIndex]);
 
-  // 3. User Answer Submission Logic
-  // Synchronous State Machine: Grades input against the EXACT question index currently visible
+  // 3. Answer Submission Logic: handles integers, decimals, and ratios (e.g. 7:3)
   const handleSubmitAnswer = () => {
     if (screenState !== 'playing') return;
-    if (isEvaluatingRef.current) return; // Prevent double-triggering
+    if (isEvaluatingRef.current) return;
     isEvaluatingRef.current = true;
 
-    // Capture index and question synchronously
     const targetIdx = currentQIndexRef.current;
     const activeSet = currentSetRef.current;
     const targetQ = activeSet?.questions[targetIdx];
@@ -232,22 +234,27 @@ export const MathArena: React.FC<MathArenaProps> = ({
     const trimmedUser = rawInput.trim();
     const expectedStr = targetQ.answer.trim();
 
-    // Clear input field immediately
     if (inputRef.current) inputRef.current.value = '';
     setInputValue('');
 
-    // Parse both to floats to prevent trailing spaces or format discrepancies
-    const userVal = parseFloat(trimmedUser);
-    const expectedVal = parseFloat(expectedStr);
+    const cleanUser = trimmedUser.replace(/\s+/g, '');
+    const cleanExpected = expectedStr.replace(/\s+/g, '');
 
-    const isCorrect =
-      trimmedUser.length > 0 && !isNaN(userVal) && !isNaN(expectedVal)
-        ? Math.abs(userVal - expectedVal) < 1e-6
-        : trimmedUser.length > 0 && trimmedUser.toLowerCase() === expectedStr.toLowerCase();
+    let isCorrect = false;
+    if (cleanExpected.includes(':')) {
+      // Ratio answer comparison: exact colon structure match
+      isCorrect = cleanUser === cleanExpected;
+    } else {
+      const userVal = parseFloat(cleanUser);
+      const expectedVal = parseFloat(cleanExpected);
+      isCorrect =
+        cleanUser.length > 0 && !isNaN(userVal) && !isNaN(expectedVal)
+          ? Math.abs(userVal - expectedVal) < 1e-6
+          : cleanUser.length > 0 && cleanUser.toLowerCase() === cleanExpected.toLowerCase();
+    }
 
     const timeSpentMs = Date.now() - questionStartTime;
 
-    // Log to Client A
     const logItem: UserMathLog = {
       id: crypto.randomUUID ? crypto.randomUUID() : `log_${Date.now()}`,
       userName: activeUsername,
@@ -271,9 +278,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
       setSessionCorrectCount((c) => c + 1);
       setSessionTotalTimeMs((t) => t + timeSpentMs);
 
-      // Check if more questions remain in this set
       if (targetIdx < activeSet.questions.length - 1) {
-        // ONLY increment index AFTER evaluation is fully resolved
         const nextIdx = targetIdx + 1;
         currentQIndexRef.current = nextIdx;
         setCurrentQIndex(nextIdx);
@@ -285,13 +290,11 @@ export const MathArena: React.FC<MathArenaProps> = ({
         setQuestionStartTime(Date.now());
         isEvaluatingRef.current = false;
       } else {
-        // Last question cleared successfully: Mark Set as "Cleared"
         handleSetCompletedSuccessfully();
         isEvaluatingRef.current = false;
       }
     } else {
-      // INCORRECT ANSWER: HALT progression immediately!
-      // Grade on the EXACT question they were looking at, do NOT increment index.
+      // WRONG ANSWER: Halt immediately and go to Post-Mortem Review
       sounds.playIncorrect();
 
       setFailedQuestions([
@@ -314,7 +317,6 @@ export const MathArena: React.FC<MathArenaProps> = ({
     const updatedPassed = Array.from(new Set([...passedSetsThisLevel, currentSet.setNumber]));
     setPassedSetsThisLevel(updatedPassed);
 
-    // Update user stats
     const stats = getUserMentalMathStats(activeUsername);
     const updatedStats = { ...stats };
     updatedStats.totalSetsCompleted += 1;
@@ -328,12 +330,12 @@ export const MathArena: React.FC<MathArenaProps> = ({
     };
     currentLevelProgress.passedSets = updatedPassed;
 
-    // WIN CONDITION: 2 Sets successfully completed advances to next level!
+    // WIN CONDITION: 2 Sets successfully completed advances to next level
     const WIN_CONDITION_SETS = 2;
     if (updatedPassed.length >= WIN_CONDITION_SETS) {
       currentLevelProgress.isCompleted = true;
       const nextLevel = levelNumber + 1;
-      if (nextLevel <= 100) {
+      if (nextLevel <= 10) {
         updatedStats.unlockedLevel = Math.max(updatedStats.unlockedLevel, nextLevel);
         if (!updatedStats.levelProgress[nextLevel]) {
           updatedStats.levelProgress[nextLevel] = {
@@ -346,7 +348,6 @@ export const MathArena: React.FC<MathArenaProps> = ({
       updatedStats.levelProgress[levelNumber] = currentLevelProgress;
       saveUserMentalMathStats(activeUsername, updatedStats);
 
-      // Call Global Analytics RPC
       updateGlobalMathAnalytics(
         activeUsername,
         levelNumber,
@@ -360,7 +361,6 @@ export const MathArena: React.FC<MathArenaProps> = ({
       updatedStats.levelProgress[levelNumber] = currentLevelProgress;
       saveUserMentalMathStats(activeUsername, updatedStats);
 
-      // Call Global Analytics RPC
       updateGlobalMathAnalytics(
         activeUsername,
         levelNumber,
@@ -373,18 +373,32 @@ export const MathArena: React.FC<MathArenaProps> = ({
     }
   };
 
-  // 5. Keyboard Handling: 't' (+5s, reduced points), 'Shift+T' (+10s, zero points), 'Enter' (submit)
+  // Keyboard navigation & Shortcuts across all screens
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // In post-mortem or victory state, let their internal listeners handle keys
-      if (screenState !== 'playing') {
-        return;
-      }
-
-      // Escape to exit Zen Mode
+      // Global Escape to exit Zen
       if (e.key === 'Escape') {
         e.preventDefault();
         onExitZen();
+        return;
+      }
+
+      // Enter key behavior across intermediate screens
+      if (e.key === 'Enter') {
+        if (screenState === 'set_passed') {
+          e.preventDefault();
+          handleProceedNextSet();
+          return;
+        }
+        if (screenState === 'level_cleared') {
+          e.preventDefault();
+          handleAdvanceLevel();
+          return;
+        }
+      }
+
+      // Only process during 'playing' state
+      if (screenState !== 'playing') {
         return;
       }
 
@@ -415,9 +429,9 @@ export const MathArena: React.FC<MathArenaProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [screenState, onExitZen]);
+  }, [screenState, onExitZen, sets, currentSetIndex, levelNumber]);
 
-  // Advance to next set after set is cleared
+  // Advance to next set in sequence
   const handleProceedNextSet = () => {
     sounds.playClick();
     const nextSetIdx = (currentSetIndex + 1) % Math.max(1, sets.length);
@@ -440,7 +454,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
   const handleAdvanceLevel = () => {
     sounds.playCorrect();
     const nextLevel = levelNumber + 1;
-    if (nextLevel <= 100) {
+    if (nextLevel <= 10) {
       setLevelNumber(nextLevel);
       if (onLevelAdvanced) onLevelAdvanced(nextLevel);
     } else {
@@ -448,19 +462,14 @@ export const MathArena: React.FC<MathArenaProps> = ({
     }
   };
 
-  // Reattempt a DIFFERENT set in that level upon failure: do not let them proceed until they pass
-  const handleRetryDifferentSet = () => {
+  // Restart CURRENT set from question 1 upon failure
+  const handleRetryCurrentSet = () => {
     sounds.playClick();
-    const nextSetIdx = sets.length > 1
-      ? (currentSetIndex + 1) % sets.length
-      : currentSetIndex;
-
     const limit = levelNumber <= 5 ? 10 : 15;
     currentQIndexRef.current = 0;
-    currentSetRef.current = sets[nextSetIdx];
+    currentSetRef.current = sets[currentSetIndex];
     isEvaluatingRef.current = false;
 
-    setCurrentSetIndex(nextSetIdx);
     setCurrentQIndex(0);
     setInputValue('');
     if (inputRef.current) inputRef.current.value = '';
@@ -471,36 +480,25 @@ export const MathArena: React.FC<MathArenaProps> = ({
     setQuestionStartTime(Date.now());
   };
 
-  // RENDER FAILURE STATE: POST-MORTEM COMPONENT
-  if (screenState === 'post_mortem' && currentSet) {
-    return (
-      <div className="fixed inset-0 z-50 bg-[#050505] text-[#f4f4f5] flex flex-col justify-center items-center overflow-y-auto p-4 select-none">
-        <PostMortemReview
-          levelNumber={levelNumber}
-          failedSet={currentSet}
-          failedQuestions={failedQuestions}
-          onRetrySet={handleRetryDifferentSet}
-          onReattemptNextSet={handleRetryDifferentSet}
-          onExitZen={onExitZen}
-          totalSetsInLevel={sets.length}
-        />
-      </div>
-    );
-  }
-
-  // RENDER FATAL ERROR (If local curriculum markdown files missing or corrupted)
-  if (getParsedMentalMath().fatalError) {
+  // 1. FATAL ERROR SCREEN: Abort and display fatal message if files missing or failed sanity check
+  if (fatalError) {
     return (
       <div className="fixed inset-0 z-50 bg-[#050505] text-[#f4f4f5] flex flex-col items-center justify-center p-6 text-center select-none font-mono">
-        <div className="max-w-md w-full p-8 border border-rose-800 rounded-2xl bg-[#09090b] space-y-4 shadow-2xl animate-in zoom-in-95 duration-200">
-          <span className="text-rose-500 font-bold text-xs uppercase tracking-widest block">// FATAL DATA ERROR</span>
-          <h2 className="text-xl font-bold text-white">Local Curriculum Files Missing</h2>
-          <p className="text-xs text-neutral-400 font-sans leading-relaxed">
-            {getParsedMentalMath().fatalError}
+        <div className="max-w-md w-full p-6 border border-rose-800 bg-[#09090b] space-y-4 rounded">
+          <div className="flex items-center justify-center gap-2 text-rose-500 font-bold text-xs uppercase tracking-widest">
+            <AlertTriangle className="w-4 h-4" />
+            <span>// FATAL CURRICULUM ERROR</span>
+          </div>
+          <h2 className="text-lg font-bold text-white">Curriculum Sanity Check Failed</h2>
+          <pre className="text-xs text-neutral-400 font-mono leading-relaxed text-left bg-[#050505] p-3 border border-neutral-800 rounded whitespace-pre-wrap">
+            {fatalError}
+          </pre>
+          <p className="text-[11px] text-neutral-500">
+            src/data/level1-5.md is hand-authored. Auto-generating questions is forbidden.
           </p>
           <button
             onClick={onExitZen}
-            className="w-full py-2.5 rounded-xl bg-neutral-900 border border-neutral-800 text-xs text-white hover:bg-neutral-800 transition-colors cursor-pointer"
+            className="w-full py-2 bg-[#121212] border border-neutral-700 text-xs text-white hover:border-neutral-500 transition-colors cursor-pointer font-mono rounded"
           >
             Exit Zen Mode (Esc)
           </button>
@@ -509,83 +507,75 @@ export const MathArena: React.FC<MathArenaProps> = ({
     );
   }
 
-  // RENDER WAITING FOR UPLOAD (When no questions uploaded for this level)
+  // 2. POST-MORTEM SCREEN: On wrong answer, halt immediately and review
+  if (screenState === 'post_mortem' && currentSet) {
+    return (
+      <div className="fixed inset-0 z-50 bg-[#050505] text-[#f4f4f5] flex flex-col justify-center items-center overflow-y-auto p-4 select-none">
+        <PostMortemReview
+          levelNumber={levelNumber}
+          failedSet={currentSet}
+          failedQuestions={failedQuestions}
+          onRetrySet={handleRetryCurrentSet}
+          onExitZen={onExitZen}
+          totalSetsInLevel={sets.length}
+        />
+      </div>
+    );
+  }
+
+  // 3. WAITING FOR CONTENT SCREEN
   if (screenState === 'waiting_for_upload' || sets.length === 0 || !currentSet || !currentQ) {
     return (
       <div className="fixed inset-0 z-50 bg-[#050505] text-[#f4f4f5] flex flex-col items-center justify-center p-6 text-center select-none font-mono">
-        <div className="max-w-md w-full p-8 border border-neutral-800 rounded-2xl bg-[#09090b] space-y-6 shadow-2xl animate-in zoom-in-95 duration-200">
-          <div className="w-14 h-14 rounded-full bg-neutral-900 border border-neutral-700 flex items-center justify-center mx-auto text-neutral-400">
-            <Upload className="w-7 h-7" />
-          </div>
-
-          <div>
-            <h2 className="text-2xl font-bold text-white tracking-tight">Waiting for upload</h2>
-            <p className="text-xs text-neutral-400 font-sans mt-2 leading-relaxed">
-              No questions found for Level {levelNumber}. Upload a file with questions to begin.
-            </p>
-          </div>
-
-          <div className="flex flex-col gap-2.5 pt-2">
-            <button
-              onClick={onExitZen}
-              style={{
-                backgroundColor: 'var(--accent)',
-                backgroundImage: 'var(--accent-gradient)',
-                color: 'var(--accent-text, #050505)',
-              }}
-              className="w-full py-3 rounded-xl font-bold text-xs uppercase tracking-wider transition-all hover:opacity-90 active:scale-95 shadow-md flex items-center justify-center gap-2 cursor-pointer"
-            >
-              <Upload className="w-4 h-4" />
-              <span>Back to Upload</span>
-            </button>
-
-            <button
-              onClick={onExitZen}
-              className="w-full py-2.5 rounded-xl text-neutral-400 hover:text-white bg-neutral-900 border border-neutral-800 text-xs font-mono transition-colors cursor-pointer"
-            >
-              Exit Zen Mode (Esc)
-            </button>
-          </div>
+        <div className="max-w-md w-full p-6 border border-neutral-800 bg-[#09090b] space-y-5 rounded">
+          <span className="text-neutral-500 font-bold text-xs uppercase tracking-widest block font-mono">
+            // LEVEL {levelNumber}
+          </span>
+          <h2 className="text-xl font-bold text-white">No questions available for Level {levelNumber}</h2>
+          <p className="text-xs text-neutral-400 font-sans leading-relaxed">
+            Curriculum content for this level has not been loaded.
+          </p>
+          <button
+            onClick={onExitZen}
+            className="w-full py-2 bg-[#121212] border border-neutral-700 text-xs text-white hover:border-neutral-500 transition-colors cursor-pointer font-mono rounded"
+          >
+            Exit Zen Mode (Esc)
+          </button>
         </div>
       </div>
     );
   }
 
-  // RENDER INTERMEDIATE SET PASSED
+  // 4. INTERMEDIATE SET PASSED SCREEN
   if (screenState === 'set_passed' && currentSet) {
     return (
       <div className="fixed inset-0 z-50 bg-[#050505] text-[#f4f4f5] flex flex-col items-center justify-center p-6 text-center select-none font-mono">
-        <div className="max-w-md w-full p-8 border border-emerald-500/80 rounded-2xl bg-[#09090b] space-y-6 shadow-2xl animate-in zoom-in-95 duration-200">
-          <div className="w-14 h-14 rounded-full bg-emerald-500/10 border border-emerald-500 flex items-center justify-center mx-auto text-emerald-400">
-            <Zap className="w-7 h-7 stroke-[2.5]" />
+        <div className="max-w-md w-full p-6 border border-emerald-600/80 bg-[#09090b] space-y-5 rounded">
+          <div className="w-10 h-10 rounded bg-[#121212] border border-emerald-600 flex items-center justify-center mx-auto text-emerald-400">
+            <Zap className="w-5 h-5" />
           </div>
 
           <div>
             <span className="text-xs uppercase text-emerald-400 tracking-widest block mb-1">
               SET {currentSet.setNumber} CLEARED
             </span>
-            <h2 className="text-2xl font-bold text-white tracking-tight">Set Velocity Passed!</h2>
+            <h2 className="text-xl font-bold text-white">Set Cleared</h2>
           </div>
 
-          <div className="p-3 bg-[#121215] border border-neutral-800 rounded-lg text-xs text-muted flex items-center justify-between">
+          <div className="p-2.5 bg-[#121212] border border-neutral-800 rounded text-xs text-neutral-400 flex items-center justify-between">
             <span>Level {levelNumber} Progress:</span>
             <span className="text-emerald-400 font-bold">
               {passedSetsThisLevel.length} / 2 Sets Won
             </span>
           </div>
 
-          <p className="text-xs text-muted font-sans leading-relaxed">
-            Need <strong>1 more set</strong> to unlock Level {levelNumber + 1}. Keep your neural focus intact.
+          <p className="text-xs text-neutral-400 font-sans leading-relaxed">
+            Solid work. 1 more clean set to unlock Level {levelNumber + 1}.
           </p>
 
           <button
             onClick={handleProceedNextSet}
-            style={{
-              backgroundColor: 'var(--accent)',
-              backgroundImage: 'var(--accent-gradient)',
-              color: 'var(--accent-text, #050505)',
-            }}
-            className="w-full py-3 rounded-xl font-bold text-xs uppercase tracking-wider transition-all hover:opacity-90 active:scale-95 shadow-md flex items-center justify-center gap-2 cursor-pointer"
+            className="w-full py-2.5 bg-emerald-500 hover:bg-emerald-400 text-black font-mono font-bold text-xs uppercase tracking-wider transition-colors flex items-center justify-center gap-2 cursor-pointer rounded"
           >
             <span>Proceed to Next Set (Enter)</span>
             <ArrowRight className="w-4 h-4" />
@@ -595,36 +585,30 @@ export const MathArena: React.FC<MathArenaProps> = ({
     );
   }
 
-  // RENDER LEVEL CLEARED (WIN CONDITION ADVANCE)
+  // 5. LEVEL CLEARED SCREEN
   if (screenState === 'level_cleared') {
     return (
       <div className="fixed inset-0 z-50 bg-[#050505] text-[#f4f4f5] flex flex-col items-center justify-center p-6 text-center select-none font-mono">
-        <div className="max-w-md w-full p-8 border border-accent rounded-2xl bg-[#09090b] space-y-6 shadow-[0_0_50px_rgba(34,197,94,0.2)] animate-in zoom-in-95 duration-200">
-          <div className="w-16 h-16 rounded-full bg-accent/15 border-2 border-accent flex items-center justify-center mx-auto text-accent">
-            <Award className="w-9 h-9 stroke-[2.5]" />
+        <div className="max-w-md w-full p-6 border border-emerald-500 bg-[#09090b] space-y-5 rounded">
+          <div className="w-12 h-12 rounded bg-[#121212] border border-emerald-500 flex items-center justify-center mx-auto text-emerald-400">
+            <Award className="w-6 h-6" />
           </div>
 
           <div>
-            <span className="text-xs uppercase text-accent tracking-widest block mb-1">
+            <span className="text-xs uppercase text-emerald-400 tracking-widest block mb-1">
               LEVEL {levelNumber} COMPLETED
             </span>
-            <h2 className="text-3xl font-extrabold text-white tracking-tight">Level Unlocked!</h2>
+            <h2 className="text-2xl font-bold text-white">Level {levelNumber + 1} Unlocked</h2>
           </div>
 
-          <p className="text-xs text-muted font-sans leading-relaxed">
-            You successfully completed 2 Sets within the time threshold. Level {levelNumber + 1} is now accessible in
-            your Mental Math training matrix.
+          <p className="text-xs text-neutral-400 font-sans leading-relaxed">
+            Two clean sets in the bag. You're ready for Level {levelNumber + 1}.
           </p>
 
-          <div className="flex flex-col gap-2.5 pt-2">
+          <div className="flex flex-col gap-2 pt-1">
             <button
               onClick={handleAdvanceLevel}
-              style={{
-                backgroundColor: 'var(--accent)',
-                backgroundImage: 'var(--accent-gradient)',
-                color: 'var(--accent-text, #050505)',
-              }}
-              className="w-full py-3 rounded-xl font-bold text-xs uppercase tracking-wider transition-all hover:opacity-90 active:scale-95 shadow-md flex items-center justify-center gap-2 cursor-pointer"
+              className="w-full py-2.5 bg-emerald-500 hover:bg-emerald-400 text-black font-mono font-bold text-xs uppercase tracking-wider transition-colors flex items-center justify-center gap-2 cursor-pointer rounded"
             >
               <span>Advance to Level {levelNumber + 1} (Enter)</span>
               <ArrowRight className="w-4 h-4" />
@@ -632,9 +616,9 @@ export const MathArena: React.FC<MathArenaProps> = ({
 
             <button
               onClick={onExitZen}
-              className="w-full py-2.5 rounded-xl text-muted hover:text-white bg-neutral-900 border border-neutral-800 text-xs font-mono transition-colors cursor-pointer"
+              className="w-full py-2 text-neutral-400 hover:text-white bg-[#121212] border border-neutral-800 text-xs font-mono transition-colors cursor-pointer rounded"
             >
-              Exit to Level Dashboard (Esc)
+              Exit to Dashboard (Esc)
             </button>
           </div>
         </div>
@@ -642,11 +626,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
     );
   }
 
-  // ========================================================
-  // 1. ZEN MODE: THE ZEN-MODE MATH ARENA
-  // Aggressively hides global navigation, sidebar, and header.
-  // Display only: Level/Set indicator, timer, math prompt, auto-focused cursor.
-  // ========================================================
+  // 6. MAIN PLAYING ARENA
   const currentSetNum = currentSet?.setNumber || 1;
   const currentQNum = currentQIndex + 1;
   const totalQInSet = currentSet?.questions.length || 6;
@@ -657,43 +637,37 @@ export const MathArena: React.FC<MathArenaProps> = ({
       onClick={() => inputRef.current?.focus()}
       className="fixed inset-0 z-50 bg-[#050505] text-[#f4f4f5] flex flex-col justify-between p-6 sm:p-10 select-none overflow-hidden font-mono cursor-default"
     >
-      {/* ======================================================== */}
-      {/* 1. TOP ROW: Level / Set Indicator & Countdown Timer      */}
-      {/* ======================================================== */}
-      <header className="w-full max-w-4xl mx-auto flex items-center justify-between border-b border-neutral-800/80 pb-4 text-xs">
-        {/* Left: Level & Set Indicator */}
+      {/* Top Header */}
+      <header className="w-full max-w-4xl mx-auto flex items-center justify-between border-b border-neutral-800 pb-4 text-xs">
         <div className="flex items-center gap-3">
-          <div className="px-2.5 py-1 rounded bg-[#121215] border border-neutral-700/80 font-bold tracking-wider text-accent text-xs">
+          <div className="px-2 py-0.5 rounded bg-[#121212] border border-neutral-800 font-bold tracking-wider text-emerald-400 text-xs">
             LVL {levelNumber.toString().padStart(2, '0')}
           </div>
           <div className="text-neutral-400 font-medium">
             SET {currentSetNum.toString().padStart(2, '0')} · Q {currentQNum}/{totalQInSet}
           </div>
-          <span className="text-neutral-600 hidden sm:inline">|</span>
+          <span className="text-neutral-700 hidden sm:inline">|</span>
           <div className="text-neutral-500 text-[11px] hidden sm:inline">
-            Target: 2 Wins to Advance ({passedSetsThisLevel.length}/2)
+            Target: 2 Sets to Advance ({passedSetsThisLevel.length}/2)
           </div>
         </div>
 
-        {/* Right: Digital Countdown Timer */}
         <div className="flex items-center gap-3">
-          <div className="text-right">
-            <span
-              className={`text-xl sm:text-2xl font-bold font-mono tabular-nums ${
-                timeLeft <= (maxTimeAllowed <= 10 ? 3 : 4)
-                  ? 'text-rose-500 animate-pulse font-extrabold'
-                  : timeLeft <= (maxTimeAllowed <= 10 ? 5 : 7)
-                  ? 'text-amber-400'
-                  : 'text-sky-400'
-              }`}
-            >
-              {timeLeft}s
-            </span>
-          </div>
+          <span
+            className={`text-xl sm:text-2xl font-bold font-mono tabular-nums ${
+              timeLeft <= (maxTimeAllowed <= 10 ? 3 : 4)
+                ? 'text-rose-500 animate-pulse'
+                : timeLeft <= (maxTimeAllowed <= 10 ? 5 : 7)
+                ? 'text-amber-400'
+                : 'text-neutral-300'
+            }`}
+          >
+            {timeLeft}s
+          </span>
 
           <button
             onClick={onExitZen}
-            className="text-neutral-500 hover:text-neutral-200 text-xs px-2 py-1 rounded hover:bg-neutral-900 border border-transparent hover:border-neutral-800 transition-colors cursor-pointer"
+            className="text-neutral-500 hover:text-white text-xs px-2 py-1 rounded bg-[#121212] border border-neutral-800 hover:border-neutral-700 transition-colors cursor-pointer"
             title="Exit Zen Mode (Esc)"
           >
             Esc
@@ -701,7 +675,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
         </div>
       </header>
 
-      {/* Subtle Smooth Timer Bar: Hardware-accelerated CSS transition */}
+      {/* Timer Bar */}
       <div className="w-full max-w-4xl mx-auto -mt-4 mb-auto">
         <div className="w-full h-1 bg-neutral-900 overflow-hidden">
           <div
@@ -710,7 +684,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
                 ? 'bg-rose-500'
                 : timeLeft <= (maxTimeAllowed <= 10 ? 5 : 7)
                 ? 'bg-amber-400'
-                : 'bg-sky-400'
+                : 'bg-emerald-500'
             }`}
             style={{
               width: `${Math.max(0, Math.min(100, (timeLeft / maxTimeAllowed) * 100))}%`,
@@ -720,73 +694,53 @@ export const MathArena: React.FC<MathArenaProps> = ({
         </div>
       </div>
 
-      {/* ======================================================== */}
-      {/* 2. CENTER: The Math Prompt & Auto-Focused Number Entry   */}
-      {/* ======================================================== */}
+      {/* Main Center Prompt */}
       <main className="my-auto w-full max-w-2xl mx-auto flex flex-col items-center justify-center text-center space-y-8">
-        {/* Subtle Category Tag */}
-        <span className="text-[11px] tracking-widest uppercase text-neutral-500 font-semibold">
+        <span className="text-[11px] tracking-widest uppercase text-neutral-500 font-semibold font-mono">
           {currentLevelMeta.category}
         </span>
 
         {/* Large Math Prompt */}
         <div className="text-5xl sm:text-7xl md:text-8xl font-black font-mono tracking-tight text-white select-none py-2">
-          {currentQ?.expression || 'Loading...'}
+          {currentQ?.expression || '...'}
         </div>
 
-        {/* Auto-Focused Blinking Terminal Number Entry */}
+        {/* Auto-Focused Number Entry (supports numbers, decimals, and colons for ratios) */}
         <div className="w-full max-w-sm relative">
           <input
             ref={inputRef}
             type="text"
-            inputMode="numeric"
-            pattern="[0-9.-]*"
+            inputMode="text"
+            pattern="[0-9.:-]*"
             autoFocus
             value={inputValue}
             onChange={(e) => {
-              // Allow numbers, negative sign, decimal
-              const val = e.target.value.replace(/[^0-9.-]/g, '');
+              // Allow numbers, negative sign, decimal, and ratio colons
+              const val = e.target.value.replace(/[^0-9.:-]/g, '');
               setInputValue(val);
             }}
             onKeyDown={(e) => {
               if (e.key === 'Enter') {
                 e.preventDefault();
                 handleSubmitAnswer();
-              } else if (e.shiftKey && (e.key === 'T' || e.key === 't')) {
-                e.preventDefault();
-                sounds.playClick();
-                setTimeLeft((prev) => prev + 10);
-                setMaxTimeAllowed((prev) => prev + 10);
-                setPenaltyFlag('zero');
-                setAddedSecondsToast({ text: '+10s (Zero Points Penalty)', penalty: 'zero' });
-                setTimeout(() => setAddedSecondsToast(null), 1800);
-              } else if (!e.shiftKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 't') {
-                e.preventDefault();
-                sounds.playClick();
-                setTimeLeft((prev) => prev + 5);
-                setMaxTimeAllowed((prev) => prev + 5);
-                setPenaltyFlag((prev) => (prev === 'zero' ? 'zero' : 'reduced'));
-                setAddedSecondsToast({ text: '+5s (Reduced Points Flagged)', penalty: 'reduced' });
-                setTimeout(() => setAddedSecondsToast(null), 1800);
               }
             }}
             placeholder="Type answer..."
-            className="w-full py-3.5 px-4 text-center text-3xl sm:text-4xl font-mono font-bold text-white bg-transparent border-b-2 border-neutral-700 focus:border-accent focus:outline-none transition-colors placeholder:text-neutral-700 placeholder:text-2xl placeholder:font-normal"
+            className="w-full py-3.5 px-4 text-center text-3xl sm:text-4xl font-mono font-bold text-white bg-transparent border-b-2 border-neutral-700 focus:border-emerald-500 focus:outline-none transition-colors placeholder:text-neutral-700 placeholder:text-2xl placeholder:font-normal"
           />
 
-          {/* Terminal Block Blinking Indicator */}
-          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-accent text-2xl animate-pulse font-mono">
+          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-emerald-400 text-2xl animate-pulse font-mono">
             ▌
           </span>
         </div>
 
-        {/* Dynamic Toast / Feedback for 't' and 'Shift+T' */}
+        {/* Toast for time extensions */}
         {addedSecondsToast && (
           <div
-            className={`text-xs px-3 py-1 rounded-full font-mono font-medium animate-in fade-in duration-150 ${
+            className={`text-xs px-2.5 py-1 rounded font-mono font-medium ${
               addedSecondsToast.penalty === 'zero'
-                ? 'bg-rose-950/60 border border-rose-500 text-rose-300'
-                : 'bg-amber-950/60 border border-amber-500 text-amber-300'
+                ? 'bg-rose-950/60 border border-rose-600 text-rose-300'
+                : 'bg-amber-950/60 border border-amber-600 text-amber-300'
             }`}
           >
             {addedSecondsToast.text}
@@ -794,12 +748,10 @@ export const MathArena: React.FC<MathArenaProps> = ({
         )}
       </main>
 
-      {/* ======================================================== */}
-      {/* 3. BOTTOM: Minimalist Keyboard Shortcut HUD              */}
-      {/* ======================================================== */}
-      <footer className="w-full max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-neutral-800/80 text-[11px] text-neutral-500">
+      {/* Keyboard HUD */}
+      <footer className="w-full max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-neutral-800 text-[11px] text-neutral-500">
         <div className="flex items-center gap-2">
-          <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-300">
+          <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-300 font-mono">
             Enter
           </kbd>
           <span>Submit</span>
@@ -807,21 +759,21 @@ export const MathArena: React.FC<MathArenaProps> = ({
 
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1.5">
-            <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-amber-400">
+            <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-amber-400 font-mono">
               t
             </kbd>
-            <span>+5s (-pts)</span>
+            <span>+5s</span>
           </div>
 
           <div className="flex items-center gap-1.5">
-            <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-rose-400">
+            <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-rose-400 font-mono">
               Shift+T
             </kbd>
-            <span>+10s (0pts)</span>
+            <span>+10s</span>
           </div>
 
           <div className="flex items-center gap-1.5">
-            <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-400">
+            <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-400 font-mono">
               Esc
             </kbd>
             <span>Exit</span>
@@ -833,3 +785,4 @@ export const MathArena: React.FC<MathArenaProps> = ({
 };
 
 export default MathArena;
+

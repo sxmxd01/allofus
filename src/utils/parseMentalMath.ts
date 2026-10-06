@@ -1,61 +1,67 @@
 import level1To5Raw from '../data/level1-5.md?raw';
 import level6To10Raw from '../data/level6-10.md?raw';
-import { MathLevel, MathSet, MathQuestion } from '../types/mentalMath';
+import {
+  MathLevel,
+  MathSet,
+  MathQuestion,
+  ParseIngestResult,
+  NormalizedMathQuestionRecord,
+} from '../types/mentalMath';
 
 /**
- * Metadata helper for levels
+ * Metadata helper for levels 1-10 hand-authored in level1-5.md and level6-10.md
  */
 export function getLocalLevelMeta(level: number): { title: string; category: string; description: string } {
   const metadataMap: Record<number, { title: string; category: string; description: string }> = {
     1: {
       title: 'Level 1: Rapid Addition & Subtraction',
       category: 'Speed Arithmetic',
-      description: 'Left-to-Right additions, round & compensate, and landmark subtractions.',
+      description: 'Left-to-Right additions, base-10 anchoring, and round-and-compensate shortcuts.',
     },
     2: {
-      title: 'Level 2: Subtraction & Landmark Decomposition',
-      category: 'Subtraction Fluency',
+      title: 'Level 2: Subtraction Fluency',
+      category: 'Landmark Decomposition',
       description: 'Stepping down tens then units, and landmark tens rounding with compensation.',
     },
     3: {
       title: 'Level 3: Complements to 1000',
       category: 'Complement Arithmetic',
-      description: 'Rapid 3-digit complements to 1000 for change and difference calculations.',
+      description: 'Rapid 3-digit complements to 1000 for differences and change calculations.',
     },
     4: {
       title: 'Level 4: Rapid Multiplication by 5 and 25',
       category: 'Multiplication Shortcuts',
-      description: 'Double & halve shortcuts, ×10/2 and ×100/4 methods.',
+      description: 'Double and halve shortcuts, times 10 divided by 2, and times 100 divided by 4.',
     },
     5: {
       title: 'Level 5: Rapid Multiplication by 9 and 11',
-      category: 'Multiplication Shortcuts',
-      description: 'Distributive 11 decomposition and ×(10-1) methods.',
+      category: 'Distributive Shortcuts',
+      description: 'Distributive 11 sandwich trick and times (10 minus 1) mental expansions.',
     },
     6: {
-      title: 'Level 6: Multiplication by 12 and 15',
-      category: 'Compound Multiplications',
-      description: 'Times 10 plus half (×15) and times 10 plus double (×12).',
+      title: 'Level 6: Percentage Shortcuts',
+      category: 'The Percentage Flip',
+      description: 'Reversible percentages (e.g. 18% of 50 = 50% of 18) for zero mental strain.',
     },
     7: {
-      title: 'Level 7: Squaring Numbers Ending in 5',
-      category: 'Mental Powers',
-      description: 'Ends-in-5 Squaring Rule: n(n+1) | 25.',
+      title: 'Level 7: Rapid Averages',
+      category: 'Seesaw Deviation',
+      description: 'Deviation from assumed mean balance to avoid large column sums.',
     },
     8: {
-      title: 'Level 8: Mental Division by 5 and 25',
-      category: 'Rapid Division',
-      description: 'Double and shift decimal (÷5) or quadruple and shift (÷25).',
+      title: 'Level 8: Simple Interest',
+      category: 'Total Effective Rate',
+      description: 'Multiply rate and time first for a single percentage hit.',
     },
     9: {
-      title: 'Level 9: Percentage Benchmarks',
-      category: 'Percentage Fluency',
-      description: '10%, 5%, 1%, 15%, 25%, and 35% rapid mental decompositions.',
+      title: 'Level 9: Compound Interest',
+      category: '2-Year CI Shortcut',
+      description: 'Fast 2-year effective rate formula (2R + R²/100).',
     },
     10: {
-      title: 'Level 10: Fractional Conversions & Caselet QT',
-      category: 'Caselet Quant Fluency',
-      description: '1/8 (12.5%), 3/8 (37.5%), 5/8 (62.5%), 1/6 (16.67%) benchmark conversions.',
+      title: 'Level 10: Mixtures & Alligations',
+      category: 'The Alligation Cross',
+      description: 'Diagonal cross subtraction for speed ratio calculations.',
     },
   };
 
@@ -68,6 +74,9 @@ export function getLocalLevelMeta(level: number): { title: string; category: str
   );
 }
 
+// Backward-compatibility alias
+export const getLevelMetadata = getLocalLevelMeta;
+
 export interface ParsedMentalMathResult {
   levels: MathLevel[];
   sets: MathSet[];
@@ -76,29 +85,83 @@ export interface ParsedMentalMathResult {
 }
 
 /**
- * Parses markdown text using the established strict regex pipeline:
- * 1. Level & Set Splitting:
+ * Compiles parsed questions across all sets into a normalized array of JSON objects
+ * matching the database schema (columns: question, answer, flow_text, mermaid_syntax, level, set).
+ */
+export function compileNormalizedQuestions(sets: MathSet[]): NormalizedMathQuestionRecord[] {
+  const normalized: NormalizedMathQuestionRecord[] = [];
+  for (const s of sets) {
+    s.questions.forEach((q, idx) => {
+      normalized.push({
+        id: q.id || `lvl${s.levelNumber}_s${s.setNumber}_q${idx + 1}`,
+        level: s.levelNumber,
+        set: s.setNumber,
+        level_number: s.levelNumber,
+        set_number: s.setNumber,
+        question_number: idx + 1,
+        question: q.question || q.expression,
+        answer: q.answer,
+        flow_text: q.flow_text || '',
+        mermaid_syntax: q.mermaid_syntax || '',
+        created_at: new Date().toISOString(),
+      });
+    });
+  }
+  return normalized;
+}
+
+/**
+ * Parses markdown text using the established strict deterministic regex pipeline:
+ * 1. Sanity check: first 4 non-empty lines of level1-5.md must match exact signature
+ * 2. Level & Set Splitting:
  *    - Split raw text by `##LEVEL:`
  *    - Split chunks by `===SET:`
  *    - Explicitly strip out or ignore `===END_SET===`
- * 2. Question & Answer Extraction:
+ * 3. Question & Answer Extraction:
  *    - Question: /(?<=Q:\s)(.*?)(?=\nA:)/s
  *    - Answer:   /(?<=A:\s)(.*?)(?=\nFLOW:)/s
- * 3. FLOW & Mermaid Isolation:
+ * 4. FLOW & Mermaid Isolation:
  *    - Flow text: /(?<=FLOW:\n)(.*?)(?=```mermaid)/s
  *    - Mermaid:   /```mermaid\n(.*?)\n```/s
  *
- * If the local markdown files cannot be found or loaded, a fatal error is returned.
+ * If the local markdown files cannot be found, loaded, or fail sanity check, a fatal error is returned.
  * AUTO-GENERATING FALLBACK QUESTIONS IS STRICTLY PROHIBITED.
  */
 export function parseMentalMath(customRawText?: string): ParsedMentalMathResult {
+  // If parsing default files (not custom text), perform mandatory sanity check
+  if (!customRawText) {
+    const rawLines = (level1To5Raw || '')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+
+    const expectedSig = ['##LEVEL: 1', '===SET: 1===', 'Q: 77+39', 'A: 116'];
+    const matchesSig =
+      rawLines.length >= 4 &&
+      rawLines[0] === expectedSig[0] &&
+      rawLines[1] === expectedSig[1] &&
+      rawLines[2] === expectedSig[2] &&
+      rawLines[3] === expectedSig[3];
+
+    if (!matchesSig) {
+      return {
+        levels: [],
+        sets: [],
+        setsByLevel: {},
+        fatalError:
+          'FATAL ERROR: Curriculum sanity check failed. First 4 non-empty lines of level1-5.md must be:\n##LEVEL: 1\n===SET: 1===\nQ: 77+39\nA: 116\nAborting Math Arena.',
+      };
+    }
+  }
+
   const combinedRaw = customRawText || `${level1To5Raw || ''}\n\n${level6To10Raw || ''}`;
   if (!combinedRaw || !combinedRaw.trim()) {
     return {
       levels: [],
       sets: [],
       setsByLevel: {},
-      fatalError: 'FATAL ERROR: Could not find or load local data files (src/data/level1-5.md, src/data/level6-10.md).',
+      fatalError:
+        'FATAL ERROR: Could not find or load local data files (src/data/level1-5.md, src/data/level6-10.md). Auto-generating questions is strictly forbidden.',
     };
   }
 
@@ -155,7 +218,7 @@ export function parseMentalMath(customRawText?: string): ParsedMentalMathResult 
 
       let setBody = firstSetLineEnd === -1 ? '' : setChunk.substring(firstSetLineEnd + 1).trim();
 
-      // CRITICAL: Explicitly strip out or ignore the ===END_SET=== strings
+      // Explicitly strip out or ignore the ===END_SET=== strings
       setBody = setBody.replace(/===END_SET===/gi, '').trim();
 
       // Split questions by `Q:\s*`
@@ -174,7 +237,6 @@ export function parseMentalMath(customRawText?: string): ParsedMentalMathResult 
         let mermaidSyntax = '';
 
         // Step 2: Question & Answer Extraction
-        // Question: /(?<=Q:\s)(.*?)(?=\nA:)/s
         const qMatchExact = qBlock.match(/(?<=Q:\s)([\s\S]*?)(?=\nA:)/);
         if (qMatchExact) {
           question = qMatchExact[1].trim();
@@ -183,7 +245,6 @@ export function parseMentalMath(customRawText?: string): ParsedMentalMathResult 
           if (qFallback) question = qFallback[1].trim();
         }
 
-        // Answer: /(?<=A:\s)(.*?)(?=\nFLOW:)/s
         const aMatchExact = qBlock.match(/(?<=A:\s)([\s\S]*?)(?=\nFLOW:)/);
         if (aMatchExact) {
           answer = aMatchExact[1].trim();
@@ -204,10 +265,8 @@ export function parseMentalMath(customRawText?: string): ParsedMentalMathResult 
             flowText = flowMatch[1].trim();
           }
         }
-        // Explicitly strip any mermaid block from flowText
         flowText = flowText.replace(/```mermaid[\s\S]*?```/gi, '').trim();
 
-        // Mermaid: /```mermaid\n(.*?)\n```/s
         const mermaidMatchExact = qBlock.match(/```mermaid\n([\s\S]*?)\n```/);
         if (mermaidMatchExact) {
           mermaidSyntax = mermaidMatchExact[1].trim();
@@ -276,6 +335,19 @@ export function parseMentalMath(customRawText?: string): ParsedMentalMathResult 
   };
 }
 
+// Ingestion parser helper for custom uploads
+export function parseDeterministicMathData(rawText: string): ParseIngestResult {
+  const parsed = parseMentalMath(rawText);
+  const normalizedQuestions = compileNormalizedQuestions(parsed.sets);
+  return {
+    levels: parsed.levels,
+    sets: parsed.sets,
+    normalizedQuestions,
+    totalQuestions: normalizedQuestions.length,
+    errors: parsed.fatalError ? [parsed.fatalError] : [],
+  };
+}
+
 // Cached singleton for instant zero-latency access
 let cachedParsed: ParsedMentalMathResult | null = null;
 
@@ -295,3 +367,4 @@ export function getAllLocalLevels(): MathLevel[] {
   const data = getParsedMentalMath();
   return data.levels;
 }
+

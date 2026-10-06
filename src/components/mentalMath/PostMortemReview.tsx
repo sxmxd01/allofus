@@ -123,15 +123,15 @@ export const PostMortemReview: React.FC<PostMortemReviewProps> = ({
 
       {/* 4. Minimalist Action HUD */}
       <div className="mt-8 pt-5 border-t border-neutral-800 flex items-center justify-between text-xs">
-        <div className="text-neutral-500 hidden sm:block">
-          Must pass a complete set to advance.
+        <div className="text-neutral-500 hidden sm:block font-mono">
+          Take a second with the shortcut, then run it back.
         </div>
 
         <div className="flex items-center gap-3 w-full sm:w-auto justify-end">
           {onExitZen && (
             <button
               onClick={onExitZen}
-              className="px-3 py-2 text-neutral-400 hover:text-white transition-colors cursor-pointer border border-transparent hover:border-neutral-800 rounded text-xs"
+              className="px-3 py-2 text-neutral-400 hover:text-white transition-colors cursor-pointer border border-transparent hover:border-neutral-800 rounded text-xs font-mono"
             >
               Exit (Esc)
             </button>
@@ -139,7 +139,7 @@ export const PostMortemReview: React.FC<PostMortemReviewProps> = ({
 
           <button
             onClick={handleRetryAction}
-            className="px-5 py-2.5 rounded font-bold text-xs uppercase tracking-wider bg-emerald-500 hover:bg-emerald-400 text-black transition-all cursor-pointer flex items-center gap-2 active:scale-95 shadow-md"
+            className="px-5 py-2.5 rounded font-bold text-xs uppercase tracking-wider bg-emerald-500 hover:bg-emerald-400 text-black transition-colors cursor-pointer flex items-center gap-2 font-mono"
           >
             <RotateCcw className="w-3.5 h-3.5 stroke-[2.5]" />
             <span>Retry Set (Enter)</span>

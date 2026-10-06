@@ -1,18 +1,23 @@
-import { supabaseOneliners, supabaseMocks } from './supabase';
+import { supabaseMocks } from './supabase';
 import { MathLevel, MathSet, MathQuestion, UserMathLog, UserMentalMathStats, NormalizedMathQuestionRecord } from '../types/mentalMath';
-import { getLevelMetadata, compileNormalizedQuestions } from '../utils/mentalMathParser';
-import { getAllLocalLevels, getLocalSetsForLevel } from '../utils/parseMentalMath';
+import {
+  getLevelMetadata,
+  compileNormalizedQuestions,
+  getAllLocalLevels,
+  getLocalSetsForLevel,
+} from '../utils/parseMentalMath';
 
 /**
- * STRICT DUAL-CLIENT ARCHITECTURE:
- * - Client A: User Client (User/Auth state, logs, global speed analytics)
- * - Client B: Content Client (Admin state; math questions now local hardcoded content)
+ * DATABASE ARCHITECTURE:
+ * ALL user data, attempts, logs, and content live on the "allofus" project (supabaseMocks).
+ * The "oneliners" project is strictly read-mostly and never written to here.
  */
-export const clientA = supabaseOneliners; // Client A: User & Auth state
-export const clientB = supabaseMocks;     // Client B: Content & Admin state
+export const clientAllofus = supabaseMocks; // allofus project: user data & content
 
-export const supabaseUserClient = clientA;
-export const supabaseContentClient = clientB;
+export const clientA = supabaseMocks;
+export const clientB = supabaseMocks;
+export const supabaseUserClient = supabaseMocks;
+export const supabaseContentClient = supabaseMocks;
 
 const LOCAL_STORAGE_LOGS_KEY = 'clat_user_math_logs';
 const LOCAL_STORAGE_STATS_KEY = 'clat_user_math_stats';
@@ -39,7 +44,7 @@ export function invalidateMathContentCache(): void {
 }
 
 /**
- * CLIENT A: Log question attempt with penalty flag and timing to user_mental_math_logs
+ * Log question attempt with penalty flag and timing to user_mental_math_logs on allofus project
  */
 export async function logMentalMathAttempt(log: UserMathLog): Promise<void> {
   // 1. Persist to local storage for zero-latency instant offline capability
@@ -54,9 +59,9 @@ export async function logMentalMathAttempt(log: UserMathLog): Promise<void> {
     console.warn('Local log save notice:', e);
   }
 
-  // 2. Client A Database insertion into user_mental_math_logs
+  // 2. Insert into user_mental_math_logs on allofus project
   try {
-    const { error } = await clientA
+    const { error } = await supabaseMocks
       .from('user_mental_math_logs')
       .insert([
         {
@@ -78,16 +83,15 @@ export async function logMentalMathAttempt(log: UserMathLog): Promise<void> {
       ]);
 
     if (error) {
-      // Table might not be created in remote Supabase schema yet; notice logged gracefully
-      console.warn('Client A user_mental_math_logs remote notice:', error.message);
+      console.warn('user_mental_math_logs remote notice:', error.message);
     }
   } catch (err) {
-    console.warn('Client A logging failed, using local store:', err);
+    console.warn('Logging failed, using local store:', err);
   }
 }
 
 /**
- * CLIENT A: Update Global Analytics RPC to factor in math training speed
+ * Update Global Analytics RPC to factor in math training speed on allofus project
  */
 export async function updateGlobalMathAnalytics(
   userName: string,
@@ -96,9 +100,8 @@ export async function updateGlobalMathAnalytics(
   passed: boolean,
   averageTimeMs: number
 ): Promise<void> {
-  // Try calling the remote RPC on Client A
   try {
-    const { error } = await clientA.rpc('update_global_math_analytics', {
+    const { error } = await supabaseMocks.rpc('update_global_math_analytics', {
       p_user_name: userName,
       p_level: level,
       p_set_number: setNumber,
@@ -107,10 +110,10 @@ export async function updateGlobalMathAnalytics(
     });
 
     if (error) {
-      console.warn('Client A update_global_math_analytics RPC notice:', error.message);
+      console.warn('update_global_math_analytics RPC notice:', error.message);
     }
   } catch (err) {
-    console.warn('Client A analytics RPC unavailable:', err);
+    console.warn('Analytics RPC unavailable:', err);
   }
 }
 

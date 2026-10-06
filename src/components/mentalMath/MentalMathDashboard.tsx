@@ -9,8 +9,8 @@ import {
 import {
   parseDeterministicMathData,
   getLevelMetadata,
-} from '../../utils/mentalMathParser';
-import { getParsedMentalMath } from '../../utils/parseMentalMath';
+  getParsedMentalMath,
+} from '../../utils/parseMentalMath';
 import { sounds } from '../../utils/sound';
 import {
   Zap,

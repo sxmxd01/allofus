@@ -10,7 +10,7 @@ import {
 } from '../utils/importParser';
 import {
   parseDeterministicMathData,
-} from '../utils/mentalMathParser';
+} from '../utils/parseMentalMath';
 import { upsertMathContentBatches } from '../lib/dualSupabase';
 import { ParseIngestResult } from '../types/mentalMath';
 import { commitImportBatch } from '../lib/clatService';
