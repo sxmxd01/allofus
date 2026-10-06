@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { MathSet, MathQuestion, PenaltyFlag, UserMathLog } from '../../types/mentalMath';
+import { MathSet, MathQuestion, PenaltyFlag, UserMathLog, UserMentalMathStats } from '../../types/mentalMath';
 import {
   logMentalMathAttempt,
   updateGlobalMathAnalytics,
-  getUserMentalMathStats,
-  saveUserMentalMathStats,
+  loadUserMentalMathProgress,
+  saveUserMentalMathProgress,
 } from '../../lib/dualSupabase';
 import {
   getLevelMetadata,
@@ -50,6 +50,9 @@ export const MathArena: React.FC<MathArenaProps> = ({
   const [penaltyFlag, setPenaltyFlag] = useState<PenaltyFlag>('none');
   const [addedSecondsToast, setAddedSecondsToast] = useState<{ text: string; penalty: PenaltyFlag } | null>(null);
 
+  // BUG 5: Track failed set numbers per level
+  const [failedSetNumbers, setFailedSetNumbers] = useState<Set<number>>(new Set());
+
   // Screen State
   const [screenState, setScreenState] = useState<ArenaScreenState>('playing');
   const [failedQuestions, setFailedQuestions] = useState<FailedQuestionRecord[]>([]);
@@ -62,6 +65,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
 
   // Level Progression: 2 wins needed to advance
   const [passedSetsThisLevel, setPassedSetsThisLevel] = useState<number[]>([]);
+  const [userStats, setUserStats] = useState<UserMentalMathStats | null>(null);
 
   // Total answers & speed tracking for this session
   const [sessionCorrectCount, setSessionCorrectCount] = useState(0);
@@ -79,6 +83,21 @@ export const MathArena: React.FC<MathArenaProps> = ({
     currentQIndexRef.current = currentQIndex;
   }, [currentQIndex]);
 
+  // BUG 6: Load progression on mount / level change from Supabase (allofus project)
+  useEffect(() => {
+    let isMounted = true;
+    loadUserMentalMathProgress(activeUsername).then((stats) => {
+      if (isMounted && stats) {
+        setUserStats(stats);
+        const passed = stats.levelProgress[levelNumber]?.passedSets || [];
+        setPassedSetsThisLevel(passed);
+      }
+    });
+    return () => {
+      isMounted = false;
+    };
+  }, [levelNumber, activeUsername]);
+
   // 1. Load Sets for Level from hardcoded local content
   useEffect(() => {
     if (fatalError) return;
@@ -93,11 +112,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
     }
 
     setSets(availableSets);
-
-    // Check user's saved progress for this level
-    const stats = getUserMentalMathStats(activeUsername);
-    const passed = stats.levelProgress[levelNumber]?.passedSets || [];
-    setPassedSetsThisLevel(passed);
+    setFailedSetNumbers(new Set()); // Reset failed set tracking for new level
 
     // Find exact set matching initialSetNumber or first unpassed set
     let startIdx = 0;
@@ -122,7 +137,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
     setMaxTimeAllowed(limit);
     setScreenState('playing');
     setQuestionStartTime(Date.now());
-  }, [levelNumber, initialSetNumber, activeUsername, fatalError]);
+  }, [levelNumber, initialSetNumber, fatalError]);
 
   const currentSet: MathSet | undefined = sets[currentSetIndex];
   const currentQ: MathQuestion | undefined = currentSet?.questions[currentQIndex];
@@ -133,8 +148,9 @@ export const MathArena: React.FC<MathArenaProps> = ({
     }
   }, [sets, currentSetIndex]);
 
-  // 2. Countdown Timer Loop: Clean 1000ms integer updates (10, 9, 8...)
+  // BUG 7: Synchronously clear timer interval on timeout
   const handleTimeout = useCallback(() => {
+    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
     if (isEvaluatingRef.current) return;
     isEvaluatingRef.current = true;
 
@@ -156,8 +172,12 @@ export const MathArena: React.FC<MathArenaProps> = ({
     if (inputRef.current) inputRef.current.value = '';
     setInputValue('');
 
+    // BUG 5: Track failed set
+    setFailedSetNumbers((prev) => new Set(prev).add(activeSet.setNumber));
+
+    // Fire-and-forget insert into user_mental_math_logs on allofus
     const logItem: UserMathLog = {
-      id: crypto.randomUUID ? crypto.randomUUID() : `log_${Date.now()}`,
+      id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `log_${Date.now()}`,
       userName: activeUsername,
       level: levelNumber,
       setNumber: activeSet.setNumber,
@@ -186,6 +206,62 @@ export const MathArena: React.FC<MathArenaProps> = ({
     isEvaluatingRef.current = false;
   }, [activeUsername, levelNumber, inputValue, questionStartTime, maxTimeAllowed, penaltyFlag]);
 
+  // BUG 1 & BUG 7: Shift+T immediately fails the set (+10s trap)
+  const handleTriggerShiftTTrap = useCallback(() => {
+    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    if (screenState !== 'playing') return;
+    if (isEvaluatingRef.current) return;
+    isEvaluatingRef.current = true;
+
+    const targetIdx = currentQIndexRef.current;
+    const activeSet = currentSetRef.current;
+    const targetQ = activeSet?.questions[targetIdx];
+
+    if (!targetQ || !activeSet) {
+      isEvaluatingRef.current = false;
+      return;
+    }
+
+    sounds.playIncorrect();
+    const timeSpent = Date.now() - questionStartTime;
+
+    if (inputRef.current) inputRef.current.value = '';
+    setInputValue('');
+
+    // Track failed set
+    setFailedSetNumbers((prev) => new Set(prev).add(activeSet.setNumber));
+
+    // Fire-and-forget insert into user_mental_math_logs
+    const logItem: UserMathLog = {
+      id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `log_${Date.now()}`,
+      userName: activeUsername,
+      level: levelNumber,
+      setNumber: activeSet.setNumber,
+      questionId: targetQ.id,
+      mathPrompt: targetQ.expression,
+      userAnswer: 'Shift+T (+10s fails set)',
+      correctAnswer: targetQ.answer,
+      isCorrect: false,
+      timeSpentMs: timeSpent,
+      timeLimitSec: Math.round(maxTimeAllowed),
+      penaltyFlag: 'zero',
+      setStatus: 'failed',
+      createdAt: new Date().toISOString(),
+    };
+    logMentalMathAttempt(logItem);
+
+    // Halt immediately and go to Post-Mortem Review
+    setFailedQuestions([
+      {
+        question: targetQ,
+        userAnswer: '+10s (fails set)',
+        isTimeout: false,
+      },
+    ]);
+    setScreenState('post_mortem');
+    isEvaluatingRef.current = false;
+  }, [screenState, questionStartTime, maxTimeAllowed, activeUsername, levelNumber]);
+
   useEffect(() => {
     if (screenState !== 'playing' || !currentQ) {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
@@ -195,7 +271,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
     timerIntervalRef.current = setInterval(() => {
       setTimeLeft((prev) => {
         if (prev <= 1) {
-          clearInterval(timerIntervalRef.current);
+          if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
           handleTimeout();
           return 0;
         }
@@ -215,8 +291,9 @@ export const MathArena: React.FC<MathArenaProps> = ({
     }
   }, [screenState, currentQIndex, currentSetIndex]);
 
-  // 3. Answer Submission Logic: handles integers, decimals, and ratios (e.g. 7:3)
+  // 3. Answer Submission Logic: BUG 7 (sync timer clear) & BUG 4 (decimal tolerance scaling)
   const handleSubmitAnswer = () => {
+    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
     if (screenState !== 'playing') return;
     if (isEvaluatingRef.current) return;
     isEvaluatingRef.current = true;
@@ -240,6 +317,10 @@ export const MathArena: React.FC<MathArenaProps> = ({
     const cleanUser = trimmedUser.replace(/\s+/g, '');
     const cleanExpected = expectedStr.replace(/\s+/g, '');
 
+    // BUG 4: Scale tolerance by decimal places in the expected answer
+    const decPlaces = (cleanExpected.split('.')[1] || '').length;
+    const tolerance = decPlaces > 0 ? Math.pow(10, -(decPlaces + 1)) : 1e-6;
+
     let isCorrect = false;
     if (cleanExpected.includes(':')) {
       // Ratio answer comparison: exact colon structure match
@@ -249,14 +330,14 @@ export const MathArena: React.FC<MathArenaProps> = ({
       const expectedVal = parseFloat(cleanExpected);
       isCorrect =
         cleanUser.length > 0 && !isNaN(userVal) && !isNaN(expectedVal)
-          ? Math.abs(userVal - expectedVal) < 1e-6
+          ? Math.abs(userVal - expectedVal) < tolerance
           : cleanUser.length > 0 && cleanUser.toLowerCase() === cleanExpected.toLowerCase();
     }
 
     const timeSpentMs = Date.now() - questionStartTime;
 
     const logItem: UserMathLog = {
-      id: crypto.randomUUID ? crypto.randomUUID() : `log_${Date.now()}`,
+      id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `log_${Date.now()}`,
       userName: activeUsername,
       level: levelNumber,
       setNumber: activeSet.setNumber,
@@ -297,6 +378,9 @@ export const MathArena: React.FC<MathArenaProps> = ({
       // WRONG ANSWER: Halt immediately and go to Post-Mortem Review
       sounds.playIncorrect();
 
+      // BUG 5: Track failed set
+      setFailedSetNumbers((prev) => new Set(prev).add(activeSet.setNumber));
+
       setFailedQuestions([
         {
           question: targetQ,
@@ -309,7 +393,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
     }
   };
 
-  // 4. Set Success & Progression State Machine
+  // 4. Set Success & Progression State Machine with Cloud Persistence (BUG 6)
   const handleSetCompletedSuccessfully = () => {
     if (!currentSet) return;
 
@@ -317,11 +401,25 @@ export const MathArena: React.FC<MathArenaProps> = ({
     const updatedPassed = Array.from(new Set([...passedSetsThisLevel, currentSet.setNumber]));
     setPassedSetsThisLevel(updatedPassed);
 
-    const stats = getUserMentalMathStats(activeUsername);
-    const updatedStats = { ...stats };
-    updatedStats.totalSetsCompleted += 1;
-    updatedStats.totalQuestionsAnswered += currentSet.questions.length;
-    updatedStats.totalQuestionsCorrect += currentSet.questions.length;
+    const baseStats = userStats || {
+      currentLevel: 1,
+      unlockedLevel: 1,
+      totalSetsCompleted: 0,
+      totalQuestionsAnswered: 0,
+      totalQuestionsCorrect: 0,
+      averageTimeMs: 0,
+      accuracyPercentage: 0,
+      penaltyCount: 0,
+      fastestAnswerMs: 0,
+      levelProgress: {},
+    };
+
+    const updatedStats: UserMentalMathStats = {
+      ...baseStats,
+      totalSetsCompleted: baseStats.totalSetsCompleted + 1,
+      totalQuestionsAnswered: baseStats.totalQuestionsAnswered + currentSet.questions.length,
+      totalQuestionsCorrect: baseStats.totalQuestionsCorrect + currentSet.questions.length,
+    };
 
     const currentLevelProgress = updatedStats.levelProgress[levelNumber] || {
       passedSets: [],
@@ -346,7 +444,10 @@ export const MathArena: React.FC<MathArenaProps> = ({
         }
       }
       updatedStats.levelProgress[levelNumber] = currentLevelProgress;
-      saveUserMentalMathStats(activeUsername, updatedStats);
+      setUserStats(updatedStats);
+
+      // Cloud Persistence UPSERT (BUG 6)
+      saveUserMentalMathProgress(activeUsername, updatedStats);
 
       updateGlobalMathAnalytics(
         activeUsername,
@@ -359,7 +460,10 @@ export const MathArena: React.FC<MathArenaProps> = ({
       setScreenState('level_cleared');
     } else {
       updatedStats.levelProgress[levelNumber] = currentLevelProgress;
-      saveUserMentalMathStats(activeUsername, updatedStats);
+      setUserStats(updatedStats);
+
+      // Cloud Persistence UPSERT (BUG 6)
+      saveUserMentalMathProgress(activeUsername, updatedStats);
 
       updateGlobalMathAnalytics(
         activeUsername,
@@ -402,26 +506,21 @@ export const MathArena: React.FC<MathArenaProps> = ({
         return;
       }
 
-      // Shift+T -> +10s (penalty = zero points)
+      // BUG 1: Shift+T immediately fails the set
       if (e.shiftKey && (e.key === 'T' || e.key === 't')) {
         e.preventDefault();
-        sounds.playClick();
-        setTimeLeft((prev) => prev + 10);
-        setMaxTimeAllowed((prev) => prev + 10);
-        setPenaltyFlag('zero');
-        setAddedSecondsToast({ text: '+10s (Zero Points Penalty)', penalty: 'zero' });
-        setTimeout(() => setAddedSecondsToast(null), 1800);
+        handleTriggerShiftTTrap();
         return;
       }
 
-      // 't' alone -> +5s (penalty = reduced points)
+      // 't' alone -> +5s
       if (!e.shiftKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 't') {
         e.preventDefault();
         sounds.playClick();
         setTimeLeft((prev) => prev + 5);
         setMaxTimeAllowed((prev) => prev + 5);
         setPenaltyFlag((prev) => (prev === 'zero' ? 'zero' : 'reduced'));
-        setAddedSecondsToast({ text: '+5s (Reduced Points Flagged)', penalty: 'reduced' });
+        setAddedSecondsToast({ text: '+5s', penalty: 'reduced' });
         setTimeout(() => setAddedSecondsToast(null), 1800);
         return;
       }
@@ -429,9 +528,9 @@ export const MathArena: React.FC<MathArenaProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [screenState, onExitZen, sets, currentSetIndex, levelNumber]);
+  }, [screenState, onExitZen, sets, currentSetIndex, levelNumber, handleTriggerShiftTTrap]);
 
-  // Advance to next set in sequence
+  // Advance to next set in sequence (when set passed)
   const handleProceedNextSet = () => {
     sounds.playClick();
     const nextSetIdx = (currentSetIndex + 1) % Math.max(1, sets.length);
@@ -462,14 +561,38 @@ export const MathArena: React.FC<MathArenaProps> = ({
     }
   };
 
-  // Restart CURRENT set from question 1 upon failure
-  const handleRetryCurrentSet = () => {
+  // BUG 5: Next Set on failure: prefer unpassed not yet attempted, else first in failedSetNumbers, else fallback
+  const handleLoadNextSetAfterFailure = () => {
     sounds.playClick();
+    if (sets.length === 0) return;
+
+    const unpassedSets = sets.filter((s) => !passedSetsThisLevel.includes(s.setNumber));
+    const unattemptedUnpassed = unpassedSets.filter(
+      (s) => !failedSetNumbers.has(s.setNumber) && s.setNumber !== currentSet?.setNumber
+    );
+
+    let nextTargetSet: MathSet | undefined;
+    if (unattemptedUnpassed.length > 0) {
+      // First unpassed set not yet attempted
+      nextTargetSet = unattemptedUnpassed[0];
+    } else if (failedSetNumbers.size > 0) {
+      // First set in failedSetNumbers (excluding current set if possible)
+      const firstFailedNum =
+        Array.from(failedSetNumbers).find((n) => n !== currentSet?.setNumber) ??
+        Array.from(failedSetNumbers)[0];
+      nextTargetSet = sets.find((s) => s.setNumber === firstFailedNum);
+    }
+
+    const nextSetIdx = nextTargetSet
+      ? sets.findIndex((s) => s.setNumber === nextTargetSet.setNumber)
+      : (currentSetIndex + 1) % sets.length;
+
     const limit = levelNumber <= 5 ? 10 : 15;
     currentQIndexRef.current = 0;
-    currentSetRef.current = sets[currentSetIndex];
+    currentSetRef.current = sets[nextSetIdx];
     isEvaluatingRef.current = false;
 
+    setCurrentSetIndex(nextSetIdx);
     setCurrentQIndex(0);
     setInputValue('');
     if (inputRef.current) inputRef.current.value = '';
@@ -507,7 +630,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
     );
   }
 
-  // 2. POST-MORTEM SCREEN: On wrong answer, halt immediately and review
+  // 2. POST-MORTEM SCREEN: On wrong answer or Shift+T fail, review and show Next Set
   if (screenState === 'post_mortem' && currentSet) {
     return (
       <div className="fixed inset-0 z-50 bg-[#050505] text-[#f4f4f5] flex flex-col justify-center items-center overflow-y-auto p-4 select-none">
@@ -515,7 +638,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
           levelNumber={levelNumber}
           failedSet={currentSet}
           failedQuestions={failedQuestions}
-          onRetrySet={handleRetryCurrentSet}
+          onRetrySet={handleLoadNextSetAfterFailure}
           onExitZen={onExitZen}
           totalSetsInLevel={sets.length}
         />
@@ -715,7 +838,6 @@ export const MathArena: React.FC<MathArenaProps> = ({
             autoFocus
             value={inputValue}
             onChange={(e) => {
-              // Allow numbers, negative sign, decimal, and ratio colons
               const val = e.target.value.replace(/[^0-9.:-]/g, '');
               setInputValue(val);
             }}
@@ -748,8 +870,8 @@ export const MathArena: React.FC<MathArenaProps> = ({
         )}
       </main>
 
-      {/* Keyboard HUD */}
-      <footer className="w-full max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-neutral-800 text-[11px] text-neutral-500">
+      {/* BUG 2: Exact Required Footer Text */}
+      <footer className="w-full max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-neutral-800 text-[11px] text-neutral-500 font-mono">
         <div className="flex items-center gap-2">
           <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-300 font-mono">
             Enter
@@ -769,7 +891,7 @@ export const MathArena: React.FC<MathArenaProps> = ({
             <kbd className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-rose-400 font-mono">
               Shift+T
             </kbd>
-            <span>+10s</span>
+            <span>+10s (fails set)</span>
           </div>
 
           <div className="flex items-center gap-1.5">
@@ -785,4 +907,5 @@ export const MathArena: React.FC<MathArenaProps> = ({
 };
 
 export default MathArena;
+
 

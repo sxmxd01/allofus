@@ -124,7 +124,7 @@ export const PostMortemReview: React.FC<PostMortemReviewProps> = ({
       {/* 4. Minimalist Action HUD */}
       <div className="mt-8 pt-5 border-t border-neutral-800 flex items-center justify-between text-xs">
         <div className="text-neutral-500 hidden sm:block font-mono">
-          Take a second with the shortcut, then run it back.
+          Must pass a complete set to advance.
         </div>
 
         <div className="flex items-center gap-3 w-full sm:w-auto justify-end">
@@ -142,7 +142,7 @@ export const PostMortemReview: React.FC<PostMortemReviewProps> = ({
             className="px-5 py-2.5 rounded font-bold text-xs uppercase tracking-wider bg-emerald-500 hover:bg-emerald-400 text-black transition-colors cursor-pointer flex items-center gap-2 font-mono"
           >
             <RotateCcw className="w-3.5 h-3.5 stroke-[2.5]" />
-            <span>Retry Set (Enter)</span>
+            <span>Next Set (Enter)</span>
           </button>
         </div>
       </div>

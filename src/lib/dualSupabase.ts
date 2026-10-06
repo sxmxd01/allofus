@@ -118,7 +118,7 @@ export async function updateGlobalMathAnalytics(
 }
 
 /**
- * Get user stats and level progression
+ * Get user stats and level progression (localStorage synchronous cache)
  */
 export function getUserMentalMathStats(userName: string): UserMentalMathStats {
   try {
@@ -148,13 +148,124 @@ export function getUserMentalMathStats(userName: string): UserMentalMathStats {
 }
 
 /**
- * Save user stats and level progression
+ * Save user stats and level progression (localStorage synchronous cache)
  */
 export function saveUserMentalMathStats(userName: string, stats: UserMentalMathStats): void {
   try {
     localStorage.setItem(`${LOCAL_STORAGE_STATS_KEY}_${userName}`, JSON.stringify(stats));
   } catch (e) {
     console.warn('Stats save error:', e);
+  }
+}
+
+/**
+ * Cloud Persistence: Load progression from user_mental_math_progress on allofus project (supabaseMocks).
+ * On mount: SELECT by user_name; if missing, seed a default row.
+ */
+export async function loadUserMentalMathProgress(userName: string): Promise<UserMentalMathStats> {
+  const localStats = getUserMentalMathStats(userName);
+
+  try {
+    const { data, error } = await supabaseMocks
+      .from('user_mental_math_progress')
+      .select('*')
+      .eq('user_name', userName)
+      .maybeSingle();
+
+    if (!error && data) {
+      const stats: UserMentalMathStats = {
+        currentLevel: data.unlocked_level || 1,
+        unlockedLevel: data.unlocked_level || 1,
+        totalSetsCompleted: data.total_sets_completed || 0,
+        totalQuestionsAnswered: data.total_questions_answered || 0,
+        totalQuestionsCorrect: data.total_questions_correct || 0,
+        averageTimeMs: localStats.averageTimeMs || 0,
+        accuracyPercentage:
+          data.total_questions_answered > 0
+            ? Math.round((data.total_questions_correct / data.total_questions_answered) * 100)
+            : 0,
+        penaltyCount: localStats.penaltyCount || 0,
+        fastestAnswerMs: localStats.fastestAnswerMs || 0,
+        levelProgress: data.level_progress || {
+          1: { passedSets: [], isUnlocked: true, isCompleted: false },
+        },
+      };
+      saveUserMentalMathStats(userName, stats);
+      return stats;
+    }
+
+    if (!error && !data) {
+      // Seed default row
+      const defaultProgression: UserMentalMathStats = {
+        currentLevel: 1,
+        unlockedLevel: 1,
+        totalSetsCompleted: 0,
+        totalQuestionsAnswered: 0,
+        totalQuestionsCorrect: 0,
+        averageTimeMs: 0,
+        accuracyPercentage: 0,
+        penaltyCount: 0,
+        fastestAnswerMs: 0,
+        levelProgress: {
+          1: { passedSets: [], isUnlocked: true, isCompleted: false },
+        },
+      };
+
+      await supabaseMocks.from('user_mental_math_progress').insert([
+        {
+          user_name: userName,
+          unlocked_level: 1,
+          total_sets_completed: 0,
+          total_questions_answered: 0,
+          total_questions_correct: 0,
+          level_progress: defaultProgression.levelProgress,
+          updated_at: new Date().toISOString(),
+        },
+      ]);
+      saveUserMentalMathStats(userName, defaultProgression);
+      return defaultProgression;
+    }
+  } catch (err) {
+    console.warn('loadUserMentalMathProgress notice, using local cache:', err);
+  }
+
+  return localStats;
+}
+
+/**
+ * Cloud Persistence: Save progression to user_mental_math_progress on allofus project (supabaseMocks).
+ * On set pass / level clear: UPSERT with new level_progress JSONB.
+ */
+export async function saveUserMentalMathProgress(
+  userName: string,
+  stats: UserMentalMathStats
+): Promise<boolean> {
+  // Update localStorage immediately as synchronous cache
+  saveUserMentalMathStats(userName, stats);
+
+  try {
+    const payload = {
+      user_name: userName,
+      unlocked_level: stats.unlockedLevel,
+      total_sets_completed: stats.totalSetsCompleted,
+      total_questions_answered: stats.totalQuestionsAnswered,
+      total_questions_correct: stats.totalQuestionsCorrect,
+      level_progress: stats.levelProgress,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabaseMocks
+      .from('user_mental_math_progress')
+      .upsert(payload, { onConflict: 'user_name' });
+
+    if (error) {
+      console.warn('saveUserMentalMathProgress error:', error.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn('saveUserMentalMathProgress network exception:', err);
+    return false;
   }
 }
 

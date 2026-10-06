@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { MathLevel, UserMentalMathStats, ParseIngestResult } from '../../types/mentalMath';
 import {
   getUserMentalMathStats,
+  loadUserMentalMathProgress,
   fetchMathLevels,
   upsertMathContentBatches,
   onContentCacheInvalidated,
@@ -63,13 +64,15 @@ export const MentalMathDashboard: React.FC<MentalMathDashboardProps> = ({
 
   // Sync latest stats & listen for live content cache invalidations
   useEffect(() => {
-    const s = getUserMentalMathStats(activeUsername);
-    setStats(s);
+    loadUserMentalMathProgress(activeUsername).then((s) => {
+      setStats(s);
+    });
 
     const unsubscribe = onContentCacheInvalidated(() => {
       loadLevelsData();
-      const updated = getUserMentalMathStats(activeUsername);
-      setStats(updated);
+      loadUserMentalMathProgress(activeUsername).then((updated) => {
+        setStats(updated);
+      });
     });
 
     return () => unsubscribe();
